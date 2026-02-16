@@ -297,7 +297,7 @@ function derive4hSignals(data, session) {
   signals.push({
     key: 'btc_accel', label: 'BTC Acceleration', category: 'crypto',
     raw: accel, display: accel >= 0 ? 'Accelerating' : 'Decelerating',
-    score: norm(accel, 1.5), weight: 0.08,
+    score: norm(accel, 1.5), weight: 0.10,
     freshness: 1.0, relevance: sesRel,
   });
 
@@ -315,8 +315,8 @@ function derive4hSignals(data, session) {
   // 4-7. TradFi MOMENTUM signals (daily change, weighted by freshness)
   const tradfiConf = [
     { key: 'sp500', label: 'S&P 500 Futures', w: 0.10, inv: false, range: 1.0, mkt: 'es_futures' },
-    { key: 'nasdaq', label: 'Nasdaq Futures', w: 0.08, inv: false, range: 1.3, mkt: 'nq_futures' },
-    { key: 'dxy', label: 'DXY (Dollar)', w: 0.11, inv: true, range: 0.4, mkt: 'forex' },
+    { key: 'nasdaq', label: 'Nasdaq Futures', w: 0.04, inv: false, range: 1.3, mkt: 'nq_futures' },
+    { key: 'dxy', label: 'DXY (Dollar)', w: 0.07, inv: true, range: 0.4, mkt: 'forex' },
     { key: 'gold', label: 'Gold Futures', w: 0.06, inv: false, range: 0.8, mkt: 'gold_futures' },
   ];
   for (const c of tradfiConf) {
@@ -351,11 +351,11 @@ function derive4hSignals(data, session) {
     signals.push({
       key: 'ethbtc_4h', label: 'ETH/BTC Flow', category: 'crypto',
       raw: ethBtc.change24h, display: `${ethBtc.change24h>=0?'+':''}${ethBtc.change24h.toFixed(2)}%`,
-      score: norm(ethBtc.change24h, 2.0), weight: 0.06,
+      score: norm(ethBtc.change24h, 2.0), weight: 0.08,
       freshness: 1.0, relevance: sesRel, price: ethBtc.priceBtc, live: ethBtc.live,
     });
   } else {
-    signals.push({ key: 'ethbtc_4h', label: 'ETH/BTC Flow', category:'crypto', missing: true, weight: 0.06 });
+    signals.push({ key: 'ethbtc_4h', label: 'ETH/BTC Flow', category:'crypto', missing: true, weight: 0.08 });
   }
 
   // 10. Fear & Greed change direction — is sentiment shifting?
@@ -364,11 +364,11 @@ function derive4hSignals(data, session) {
     signals.push({
       key: 'fg_4h', label: 'Sentiment Shift', category: 'crypto',
       raw: fgChg, display: `${fgChg>=0?'+':''}${fgChg} (${fearGreed.value} ${fearGreed.label})`,
-      score: norm(fgChg, 10), weight: 0.04,
+      score: norm(fgChg, 10), weight: 0.05,
       freshness: 0.8, relevance: sesRel, live: fearGreed.live,
     });
   } else {
-    signals.push({ key: 'fg_4h', label: 'Sentiment Shift', category:'crypto', missing: !fearGreed, weight: 0.04,
+    signals.push({ key: 'fg_4h', label: 'Sentiment Shift', category:'crypto', missing: !fearGreed, weight: 0.05,
       raw: fearGreed?.value, display: fearGreed ? `${fearGreed.value} ${fearGreed.label}` : '—',
       score: fearGreed ? (fearGreed.value - 50) * 0.8 : 0, freshness: 0.8, relevance: sesRel, live: fearGreed?.live,
     });
@@ -401,11 +401,11 @@ function derive4hSignals(data, session) {
     signals.push({
       key: 'funding_4h', label: 'Funding Rate', category: 'crypto',
       raw: funding.rate, display: `${(funding.rate*100).toFixed(4)}% (${ann>=0?'+':''}${ann.toFixed(0)}% ann.)`,
-      score: fScore, weight: 0.15,
+      score: fScore, weight: 0.18,
       freshness: 1.0, relevance: sesRel, live: funding.live,
     });
   } else {
-    signals.push({ key: 'funding_4h', label: 'Funding Rate', category:'crypto', missing: true, weight: 0.15 });
+    signals.push({ key: 'funding_4h', label: 'Funding Rate', category:'crypto', missing: true, weight: 0.18 });
   }
 
   return signals;
@@ -451,8 +451,8 @@ function derive24hSignals(data, session) {
 
   // 4-8. TradFi REGIME signals: daily change + multi-day trend blended
   const tradfiConf = [
-    { key: 'sp500', label: 'S&P 500 Regime', w: 0.08, inv: false, range: 1.0, tRange: 1.5 },
-    { key: 'nasdaq', label: 'Nasdaq Regime', w: 0.06, inv: false, range: 1.3, tRange: 2.0 },
+    { key: 'sp500', label: 'S&P 500 Regime', w: 0.10, inv: false, range: 1.0, tRange: 1.5 },
+    { key: 'nasdaq', label: 'Nasdaq Regime', w: 0.04, inv: false, range: 1.3, tRange: 2.0 },
     { key: 'dxy', label: 'DXY Regime', w: 0.10, inv: true, range: 0.4, tRange: 0.6 },
     { key: 'gold', label: 'Gold Regime', w: 0.06, inv: false, range: 0.8, tRange: 1.2 },
     { key: 'tenYear', label: '10Y Yield Regime', w: 0.06, inv: true, range: 2.0, tRange: 3.0 },
@@ -483,11 +483,11 @@ function derive24hSignals(data, session) {
     signals.push({
       key: 'vix_24h', label: 'VIX Regime', category: 'tradfi',
       raw: vixLevel, display: `${vixLevel.toFixed(1)} (${vixLevel<16?'Low fear':vixLevel<20?'Normal':vixLevel<25?'Elevated':vixLevel<30?'High fear':'Extreme fear'})`, price: vd.price,
-      score: vixLevelScore, weight: 0.08,
+      score: vixLevelScore, weight: 0.10,
       freshness: freshness24h(vd.ageH), relevance: tradRel, ageH: vd.ageH, live: vd.live,
     });
   } else {
-    signals.push({ key: 'vix_24h', label: 'VIX Regime', category:'tradfi', missing: true, weight: 0.08 });
+    signals.push({ key: 'vix_24h', label: 'VIX Regime', category:'tradfi', missing: true, weight: 0.10 });
   }
 
   // 10. ETH/BTC trend
@@ -519,7 +519,7 @@ function derive24hSignals(data, session) {
   signals.push({
     key: 'btc_7d', label: 'BTC 7d Change', category: 'crypto',
     raw: chg7d, display: `${chg7d>=0?'+':''}${chg7d.toFixed(2)}%`,
-    score: norm(chg7d, 8.0), weight: 0.06,
+    score: norm(chg7d, 8.0), weight: 0.04,
     freshness: 1.0, relevance: sesRel,
   });
 
@@ -795,7 +795,7 @@ function MethodNote() {
         v3 uses <strong className="text-blue-400">two fundamentally different scoring models</strong>, not just different weights on the same signals:
       </p>
       <p className="mb-2">
-        <strong className="text-blue-400">4h Tactical Momentum</strong> asks "what is the short-term flow direction?" It uses BTC's 4-hour price change (18% weight) and <strong className="text-gray-400">perp funding rate as a contrarian signal</strong> (15% weight — extreme positive funding signals overleveraged longs vulnerable to liquidation). Also includes acceleration, VIX direction, sentiment shift, and mean-reversion-aware range position.
+        <strong className="text-blue-400">4h Tactical Momentum</strong> asks "what is the short-term flow direction?" It uses BTC's 4-hour price change (18% weight) and <strong className="text-gray-400">perp funding rate as a contrarian signal</strong> (18% weight — extreme positive funding signals overleveraged longs vulnerable to liquidation). Also includes acceleration, VIX direction, sentiment shift, and mean-reversion-aware range position.
       </p>
       <p className="mb-2">
         <strong className="text-purple-400">24h Macro Regime</strong> asks "what is the broader environment?" It uses BTC's <strong className="text-gray-400">multi-day trend direction</strong> (12% weight), <strong className="text-gray-400">funding rate regime</strong> (10% weight — sustained high funding = overheated market, negative funding = contrarian bullish), blended TradFi trends (60% multi-day / 40% daily), VIX <em>absolute level</em> bands, and Fear & Greed <em>absolute level</em>.
