@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BTC Macro Pulse — Cross-Market Sentiment Engine</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.0/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { mono: ['JetBrains Mono', 'monospace'], sans: ['Inter', 'sans-serif'] },
+          colors: {
+            terminal: { bg: '#080c14', card: '#0f1724', border: '#1a2540', highlight: '#1e3a5f' },
+            bull: { light: '#4ade80', DEFAULT: '#22c55e', dark: '#15803d' },
+            bear: { light: '#f87171', DEFAULT: '#ef4444', dark: '#b91c1c' },
+            warn: '#f59e0b',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #080c14; }
+    @keyframes pulse-glow { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+    @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-fade-in { animation: fade-in 0.5s ease-out forwards; }
+    .gauge-glow { filter: drop-shadow(0 0 12px var(--glow-color)); }
+    .card-hover { transition: all 0.2s ease; }
+    .card-hover:hover { background: #162033; border-color: #2a4060; transform: translateY(-1px); }
+    .live-dot { animation: pulse-glow 2s ease-in-out infinite; }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #0f1724; } ::-webkit-scrollbar-thumb { background: #1a2540; border-radius: 3px; }
+  </style>
+</head>
+<body class="min-h-screen text-gray-100 antialiased font-sans">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+    // =============================================
+    // CONFIGURATION
+    // =============================================
+    const SCORING_CONFIG = {
+      sp500:    { weight: 0.20, inverse: false, label: 'S&P 500',        symbol: 'SPY',      typicalRange: 1.0,  yahoo: '%5EGSPC' },
+      nasdaq:   { weight: 0.15, inverse: false, label: 'Nasdaq 100',     symbol: 'QQQ',      typicalRange: 1.3,  yahoo: '%5EIXIC' },
+      gold:     { weight: 0.10, inverse: false, label: 'Gold',           symbol: 'GC=F',     typicalRange: 0.8,  yahoo: 'GC%3DF' },
+      dxy:      { weight: 0.18, inverse: true,  label: 'US Dollar (DXY)',symbol: 'DX-Y.NYB', typicalRange: 0.4,  yahoo: 'DX-Y.NYB' },
+      vix:      { weight: 0.15, inverse: true,  label: 'VIX',            symbol: '^VIX',     typicalRange: 5.0,  yahoo: '%5EVIX', isLevel: true },
+      tenYear:  { weight: 0.10, inverse: true,  label: '10Y Yield',      symbol: '^TNX',     typicalRange: 2.0,  yahoo: '%5ETNX' },
+      btcMom:   { weight: 0.12, inverse: false, label: 'BTC Momentum',   symbol: 'BTC',      typicalRange: 3.0 },
+    };
+
+    const PROXY_CHAINS = [
+      (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+      (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    ];
+
+    // =============================================
+    // API LAYER
+    // =============================================
+    async function fetchWithProxy(url) {
+      for (const makeProxy of PROXY_CHAINS) {
+        try {
+          const res = await fetch(makeProxy(url), { signal: AbortSignal.timeout(8000) });
+          if (res.ok) {
+            const text = await res.text();
+            return JSON.parse(text);
+          }
+        } catch (e) { /* try next proxy */ }
+      }
+      return null;
+    }
+
+    async function fetchBTC() {
+      try {
+        const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true');
+        const data = await res.json();
+        return {
+          price: data.bitcoin.usd,
+          change24h: data.bitcoin.usd_24h_change,
+          volume: data.bitcoin.usd_24h_vol,
+          marketCap: data.bitcoin.usd_market_cap,
+          live: true,
+        };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function fetchFearGreed() {
+      try {
+        const res = await fetch('https://api.alternative.me/fng/?limit=1');
+        const data = await res.json();
+        return {
+          value: parseInt(data.data[0].value),
+          label: data.data[0].value_classification,
+          live: true,
+        };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function fetchYahooQuote(yahooSymbol) {
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1d&range=5d`;
+      const data = await fetchWithProxy(url);
+      if (!data || !data.chart || !data.chart.result) return null;
+
+      const result = data.chart.result[0];
+      const meta = result.meta;
+      const closes = result.indicators.quote[0].close.filter(c => c !== null);
+
+      if (closes.length < 2) return null;
+
+      const current = meta.regularMarketPrice || closes[closes.length - 1];
+      const prevClose = meta.chartPreviousClose || closes[closes.length - 2];
+      const change = ((current - prevClose) / prevClose) * 100;
+
+      return { price: current, prevClose, change, live: true };
+    }
+
+    async function fetchAllTraditionalMarkets() {
+      const keys = ['sp500', 'nasdaq', 'gold', 'dxy', 'vix', 'tenYear'];
+      const results = {};
+
+      const promises = keys.map(async (key) => {
+        const config = SCORING_CONFIG[key];
+        const data = await fetchYahooQuote(config.yahoo);
+        results[key] = data;
+      });
+
+      await Promise.allSettled(promises);
+      return results;
+    }
+
+    // =============================================
+    // DEMO / FALLBACK DATA
+    // =============================================
+    function getDemoData() {
+      return {
+        btc: { price: 97425.30, change24h: 2.14, volume: 38200000000, marketCap: 1920000000000, live: false },
+        fearGreed: { value: 72, label: 'Greed', live: false },
+        markets: {
+          sp500:   { price: 6078.73, prevClose: 6025.10, change: 0.89, live: false },
+          nasdaq:  { price: 19747.30, prevClose: 19580.25, change: 0.85, live: false },
+          gold:    { price: 2935.40, prevClose: 2918.70, change: 0.57, live: false },
+          dxy:     { price: 106.82, prevClose: 107.15, change: -0.31, live: false },
+          vix:     { price: 15.24, prevClose: 16.10, change: -5.34, live: false },
+          tenYear: { price: 4.48, prevClose: 4.52, change: -0.88, live: false },
+        }
+      };
+    }
+
+    // =============================================
+    // SCORING ENGINE
+    // =============================================
+    function normalizeChange(pctChange, typicalRange) {
+      const normalized = (pctChange / typicalRange) * 50;
+      return Math.max(-100, Math.min(100, normalized));
+    }
+
+    function getVixSignal(level) {
+      if (level < 13) return 50;
+      if (level < 16) return 30;
+      if (level < 20) return 0;
+      if (level < 25) return -30;
+      if (level < 30) return -60;
+      return -85;
+    }
+
+    function computeSignals(markets, btcData) {
+      const signals = {};
+
+      for (const [key, config] of Object.entries(SCORING_CONFIG)) {
+        if (key === 'btcMom') {
+          const raw = btcData ? btcData.change24h : 0;
+          const signal = normalizeChange(raw, config.typicalRange);
+          signals[key] = {
+            raw: raw,
+            signal: signal,
+            weighted: signal * config.weight,
+            weight: config.weight,
+            label: config.label,
+            inverse: config.inverse,
+          };
+          continue;
+        }
+
+        const mktData = markets[key];
+        if (!mktData) {
+          signals[key] = { raw: 0, signal: 0, weighted: 0, weight: config.weight, label: config.label, inverse: config.inverse, missing: true };
+          continue;
+        }
+
+        let signal;
+        if (config.isLevel) {
+          signal = getVixSignal(mktData.price);
+        } else {
+          signal = normalizeChange(mktData.change, config.typicalRange);
+        }
+
+        if (config.inverse) signal = -signal;
+
+        signals[key] = {
+          raw: config.isLevel ? mktData.price : mktData.change,
+          signal: signal,
+          weighted: signal * config.weight,
+          weight: config.weight,
+          label: config.label,
+          price: mktData.price,
+          change: mktData.change,
+          inverse: config.inverse,
+          isLevel: config.isLevel,
+        };
+      }
+
+      return signals;
+    }
+
+    function computeMacroScore(signals) {
+      let totalWeight = 0;
+      let weightedSum = 0;
+
+      for (const s of Object.values(signals)) {
+        if (!s.missing) {
+          weightedSum += s.weighted;
+          totalWeight += s.weight;
+        }
+      }
+
+      if (totalWeight === 0) return 0;
+      return Math.round(Math.max(-100, Math.min(100, weightedSum / totalWeight * (1 / Math.max(...Object.values(signals).map(s => s.weight)))  )));
+    }
+
+    function computeFinalScore(signals) {
+      let sum = 0;
+      for (const s of Object.values(signals)) {
+        if (!s.missing) sum += s.weighted;
+      }
+      return Math.round(Math.max(-100, Math.min(100, sum)));
+    }
+
+    function getScoreLabel(score) {
+      if (score >= 60) return 'Strongly Bullish';
+      if (score >= 30) return 'Bullish';
+      if (score >= 10) return 'Leaning Bullish';
+      if (score >= -10) return 'Neutral';
+      if (score >= -30) return 'Leaning Bearish';
+      if (score >= -60) return 'Bearish';
+      return 'Strongly Bearish';
+    }
+
+    function getScoreColor(score) {
+      if (score >= 40) return '#22c55e';
+      if (score >= 15) return '#4ade80';
+      if (score >= -15) return '#f59e0b';
+      if (score >= -40) return '#f87171';
+      return '#ef4444';
+    }
+
+    function generateSummary(signals, score, btcData, fearGreed) {
+      const label = score >= 30 ? 'bullish' : score >= 10 ? 'slightly bullish' : score >= -10 ? 'neutral' : score >= -30 ? 'slightly bearish' : 'bearish';
+
+      const entries = Object.entries(signals).filter(([_, s]) => !s.missing);
+      const bullishDrivers = entries.filter(([_, s]) => s.weighted > 3).sort((a, b) => b[1].weighted - a[1].weighted);
+      const bearishDrivers = entries.filter(([_, s]) => s.weighted < -3).sort((a, b) => a[1].weighted - b[1].weighted);
+
+      let parts = [`Cross-market conditions are <strong>${label}</strong> for Bitcoin today.`];
+
+      if (bullishDrivers.length > 0) {
+        const drivers = bullishDrivers.slice(0, 3).map(([_, s]) => {
+          if (s.isLevel) return `${s.label} subdued at ${s.price?.toFixed(1)}`;
+          if (s.label === 'BTC Momentum') return `BTC momentum positive (${s.raw >= 0 ? '+' : ''}${s.raw?.toFixed(1)}%)`;
+          const dir = s.inverse ? (s.change < 0 ? 'weakening' : 'strengthening') : (s.change > 0 ? 'up' : 'down');
+          return `${s.label} ${dir} ${Math.abs(s.change)?.toFixed(2)}%`;
+        });
+        parts.push(`Bullish drivers: ${drivers.join(', ')}.`);
+      }
+
+      if (bearishDrivers.length > 0) {
+        const risks = bearishDrivers.slice(0, 2).map(([_, s]) => {
+          if (s.isLevel) return `${s.label} elevated at ${s.price?.toFixed(1)}`;
+          if (s.label === 'BTC Momentum') return `BTC short-term momentum negative`;
+          const dir = s.inverse ? (s.change > 0 ? 'rising' : 'falling') : (s.change < 0 ? 'declining' : 'rising');
+          return `${s.label} ${dir} ${Math.abs(s.change)?.toFixed(2)}%`;
+        });
+        parts.push(`Key risks: ${risks.join(', ')}.`);
+      }
+
+      if (fearGreed) {
+        parts.push(`Crypto sentiment: ${fearGreed.label} (${fearGreed.value}/100).`);
+      }
+
+      return parts.join(' ');
+    }
+
+    // =============================================
+    // COMPONENTS
+    // =============================================
+
+    function GaugeChart({ score, size = 280 }) {
+      const center = size / 2;
+      const radius = size * 0.38;
+      const strokeWidth = size * 0.06;
+      const innerRadius = radius - strokeWidth / 2;
+
+      const scoreAngle = Math.PI * (100 - score) / 200;
+      const needleLength = radius - strokeWidth - 8;
+
+      const needleX = center + needleLength * Math.cos(scoreAngle);
+      const needleY = center - needleLength * Math.sin(scoreAngle);
+
+      const arcPath = (startAngle, endAngle, r) => {
+        const x1 = center + r * Math.cos(startAngle);
+        const y1 = center - r * Math.sin(startAngle);
+        const x2 = center + r * Math.cos(endAngle);
+        const y2 = center - r * Math.sin(endAngle);
+        const large = endAngle - startAngle > Math.PI ? 0 : 1;
+        return `M ${x1} ${y1} A ${r} ${r} 0 ${large} 0 ${x2} ${y2}`;
+      };
+
+      const filledEnd = scoreAngle;
+      const color = getScoreColor(score);
+
+      return (
+        <div className="relative flex items-center justify-center" style={{ width: size, height: size * 0.62 }}>
+          <svg width={size} height={size * 0.62} viewBox={`0 0 ${size} ${size * 0.62}`}>
+            <defs>
+              <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="#ef4444" />
+                <stop offset="35%" stopColor="#f59e0b" />
+                <stop offset="50%" stopColor="#eab308" />
+                <stop offset="65%" stopColor="#84cc16" />
+                <stop offset="100%" stopColor="#22c55e" />
+              </linearGradient>
+              <filter id="glow">
+                <feGaussianBlur stdDeviation="3" result="blur" />
+                <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+              </filter>
+            </defs>
+
+            {/* Background arc */}
+            <path d={arcPath(Math.PI, 0, radius)} fill="none" stroke="#1a2540" strokeWidth={strokeWidth} strokeLinecap="round" />
+
+            {/* Colored arc */}
+            <path d={arcPath(Math.PI, filledEnd, radius)} fill="none" stroke="url(#gaugeGrad)" strokeWidth={strokeWidth} strokeLinecap="round" filter="url(#glow)" />
+
+            {/* Tick marks */}
+            {[-100, -75, -50, -25, 0, 25, 50, 75, 100].map((tick) => {
+              const angle = Math.PI * (100 - tick) / 200;
+              const outerR = radius + strokeWidth / 2 + 4;
+              const innerR = radius + strokeWidth / 2 + (tick % 50 === 0 ? 14 : 8);
+              const x1 = center + outerR * Math.cos(angle);
+              const y1 = center - outerR * Math.sin(angle);
+              const x2 = center + innerR * Math.cos(angle);
+              const y2 = center - innerR * Math.sin(angle);
+              return <line key={tick} x1={x1} y1={y1} x2={x2} y2={y2} stroke="#374151" strokeWidth={tick % 50 === 0 ? 2 : 1} />;
+            })}
+
+            {/* Labels */}
+            <text x={center - radius - 20} y={center + 16} fill="#6b7280" fontSize="11" fontFamily="JetBrains Mono" textAnchor="middle">-100</text>
+            <text x={center} y={center - radius - 14} fill="#6b7280" fontSize="11" fontFamily="JetBrains Mono" textAnchor="middle">0</text>
+            <text x={center + radius + 20} y={center + 16} fill="#6b7280" fontSize="11" fontFamily="JetBrains Mono" textAnchor="middle">+100</text>
+
+            {/* Needle */}
+            <line x1={center} y1={center} x2={needleX} y2={needleY} stroke={color} strokeWidth={2.5} strokeLinecap="round" filter="url(#glow)" />
+            <circle cx={center} cy={center} r={6} fill={color} filter="url(#glow)" />
+            <circle cx={center} cy={center} r={3} fill="#080c14" />
+          </svg>
+        </div>
+      );
+    }
+
+    function ScoreHero({ score, summary, loading }) {
+      const color = getScoreColor(score);
+      const label = getScoreLabel(score);
+
+      return (
+        <div className="flex flex-col items-center py-6 animate-fade-in">
+          <GaugeChart score={loading ? 0 : score} />
+          <div className="text-center -mt-2">
+            <div className="font-mono text-5xl font-bold tracking-tight" style={{ color }}>
+              {loading ? '—' : (score > 0 ? '+' : '')}{loading ? '' : score}
+            </div>
+            <div className="text-lg font-semibold mt-1" style={{ color }}>{loading ? 'Loading...' : label}</div>
+            <div className="text-xs text-gray-500 mt-1 font-mono">BEAR -100 {'<'}---{'>'} +100 BULL</div>
+          </div>
+          {!loading && summary && (
+            <div className="mt-5 max-w-2xl text-center text-sm text-gray-400 leading-relaxed px-4" dangerouslySetInnerHTML={{ __html: summary }} />
+          )}
+        </div>
+      );
+    }
+
+    function MarketCard({ label, price, change, signal, weight, inverse, isLevel, live, missing }) {
+      if (missing) {
+        return (
+          <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 opacity-50">
+            <div className="text-xs text-gray-500 font-mono uppercase tracking-wider">{label}</div>
+            <div className="text-gray-600 text-sm mt-2">No data</div>
+          </div>
+        );
+      }
+
+      const changeColor = change > 0 ? 'text-bull-light' : change < 0 ? 'text-bear-light' : 'text-gray-400';
+      const signalColor = signal > 10 ? 'text-bull-light' : signal < -10 ? 'text-bear-light' : 'text-warn';
+      const signalBg = signal > 10 ? 'bg-green-900/30' : signal < -10 ? 'bg-red-900/30' : 'bg-yellow-900/20';
+
+      const formatPrice = (p) => {
+        if (!p) return '—';
+        if (p > 10000) return p.toLocaleString('en-US', { maximumFractionDigits: 0 });
+        if (p > 100) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
+        return p.toFixed(2);
+      };
+
+      return (
+        <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 card-hover animate-fade-in">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-gray-500 font-mono uppercase tracking-wider">{label}</div>
+            {live !== undefined && (
+              <div className={`w-1.5 h-1.5 rounded-full ${live ? 'bg-green-500 live-dot' : 'bg-yellow-600'}`} title={live ? 'Live data' : 'Demo data'} />
+            )}
+          </div>
+          <div className="font-mono text-xl font-semibold text-white">{formatPrice(price)}</div>
+          <div className="flex items-center justify-between mt-2">
+            <span className={`font-mono text-sm ${changeColor}`}>
+              {isLevel ? `Level` : `${change >= 0 ? '+' : ''}${change?.toFixed(2)}%`}
+            </span>
+            <span className={`font-mono text-xs px-2 py-0.5 rounded ${signalBg} ${signalColor}`}>
+              {signal > 0 ? '+' : ''}{Math.round(signal)} sig
+            </span>
+          </div>
+          <div className="mt-2 w-full bg-gray-800 rounded-full h-1">
+            <div
+              className="h-1 rounded-full transition-all duration-500"
+              style={{
+                width: `${Math.min(100, Math.abs(signal))}%`,
+                marginLeft: signal < 0 ? `${100 - Math.abs(signal)}%` : '0',
+                backgroundColor: signal > 0 ? '#22c55e' : signal < 0 ? '#ef4444' : '#f59e0b',
+              }}
+            />
+          </div>
+          <div className="text-[10px] text-gray-600 mt-1 font-mono">
+            Weight: {(weight * 100).toFixed(0)}% {inverse ? '(inverse)' : ''}
+          </div>
+        </div>
+      );
+    }
+
+    function BTCCard({ btcData, live }) {
+      if (!btcData) return null;
+      const changeColor = btcData.change24h >= 0 ? 'text-bull-light' : 'text-bear-light';
+
+      return (
+        <div className="bg-terminal-card border-2 border-terminal-highlight rounded-lg p-4 card-hover animate-fade-in col-span-full sm:col-span-1">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-orange-400 font-mono uppercase tracking-wider font-bold">Bitcoin</div>
+            <div className={`w-1.5 h-1.5 rounded-full ${live ? 'bg-green-500 live-dot' : 'bg-yellow-600'}`} />
+          </div>
+          <div className="font-mono text-2xl font-bold text-orange-400">
+            ${btcData.price?.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+          </div>
+          <div className={`font-mono text-sm mt-1 ${changeColor}`}>
+            {btcData.change24h >= 0 ? '+' : ''}{btcData.change24h?.toFixed(2)}% (24h)
+          </div>
+          <div className="text-xs text-gray-500 mt-1 font-mono">
+            Vol: ${(btcData.volume / 1e9)?.toFixed(1)}B &middot; MCap: ${(btcData.marketCap / 1e12)?.toFixed(2)}T
+          </div>
+        </div>
+      );
+    }
+
+    function FearGreedCard({ data }) {
+      if (!data) return null;
+      const color = data.value >= 75 ? '#22c55e' : data.value >= 55 ? '#4ade80' : data.value >= 45 ? '#f59e0b' : data.value >= 25 ? '#f87171' : '#ef4444';
+
+      return (
+        <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 card-hover animate-fade-in">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-gray-500 font-mono uppercase tracking-wider">Fear & Greed</div>
+            <div className={`w-1.5 h-1.5 rounded-full ${data.live ? 'bg-green-500 live-dot' : 'bg-yellow-600'}`} />
+          </div>
+          <div className="font-mono text-xl font-semibold" style={{ color }}>{data.value}</div>
+          <div className="text-sm mt-1" style={{ color }}>{data.label}</div>
+          <div className="mt-2 w-full bg-gray-800 rounded-full h-1.5">
+            <div className="h-1.5 rounded-full transition-all duration-500" style={{ width: `${data.value}%`, backgroundColor: color }} />
+          </div>
+        </div>
+      );
+    }
+
+    function SignalTable({ signals }) {
+      const sorted = Object.entries(signals).sort((a, b) => Math.abs(b[1].weighted) - Math.abs(a[1].weighted));
+
+      return (
+        <div className="animate-fade-in">
+          <h3 className="text-sm font-mono text-gray-500 uppercase tracking-wider mb-3">Signal Breakdown</h3>
+          <div className="bg-terminal-card border border-terminal-border rounded-lg overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-terminal-border">
+                  <th className="text-left p-3 text-xs font-mono text-gray-500 uppercase">Signal</th>
+                  <th className="text-right p-3 text-xs font-mono text-gray-500 uppercase">Raw</th>
+                  <th className="text-right p-3 text-xs font-mono text-gray-500 uppercase">Score</th>
+                  <th className="text-right p-3 text-xs font-mono text-gray-500 uppercase">Weight</th>
+                  <th className="text-right p-3 text-xs font-mono text-gray-500 uppercase">Contribution</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(([key, s]) => {
+                  const contribColor = s.weighted > 2 ? 'text-bull-light' : s.weighted < -2 ? 'text-bear-light' : 'text-gray-400';
+                  return (
+                    <tr key={key} className="border-b border-terminal-border/50 hover:bg-terminal-highlight/20">
+                      <td className="p-3 font-mono text-gray-300">
+                        {s.label}
+                        {s.inverse && <span className="text-[10px] text-gray-600 ml-1">(inv)</span>}
+                      </td>
+                      <td className="p-3 text-right font-mono text-gray-400">
+                        {s.missing ? '—' : s.isLevel ? s.raw?.toFixed(1) : `${s.raw >= 0 ? '+' : ''}${s.raw?.toFixed(2)}%`}
+                      </td>
+                      <td className="p-3 text-right font-mono">
+                        <span className={s.signal > 0 ? 'text-bull-light' : s.signal < 0 ? 'text-bear-light' : 'text-gray-400'}>
+                          {s.missing ? '—' : `${s.signal > 0 ? '+' : ''}${Math.round(s.signal)}`}
+                        </span>
+                      </td>
+                      <td className="p-3 text-right font-mono text-gray-500">{(s.weight * 100).toFixed(0)}%</td>
+                      <td className={`p-3 text-right font-mono font-semibold ${contribColor}`}>
+                        {s.missing ? '—' : `${s.weighted > 0 ? '+' : ''}${s.weighted.toFixed(1)}`}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              <tfoot>
+                <tr className="bg-terminal-highlight/30">
+                  <td colSpan={4} className="p-3 font-mono font-semibold text-gray-300">Macro Score</td>
+                  <td className="p-3 text-right font-mono font-bold text-lg" style={{ color: getScoreColor(Object.values(signals).reduce((sum, s) => sum + (s.missing ? 0 : s.weighted), 0)) }}>
+                    {(() => { const total = Math.round(Math.max(-100, Math.min(100, Object.values(signals).reduce((sum, s) => sum + (s.missing ? 0 : s.weighted), 0)))); return `${total > 0 ? '+' : ''}${total}`; })()}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    function MethodologyNote() {
+      return (
+        <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 text-xs text-gray-500 leading-relaxed animate-fade-in">
+          <h4 className="font-mono uppercase tracking-wider text-gray-400 mb-2">Methodology</h4>
+          <p>
+            The Macro Pulse score is a weighted composite of cross-market signals normalised to a -100 (max bearish) to +100 (max bullish) scale.
+            Each market's daily move is normalised against its typical daily range to produce a signal score.
+            Inverse-correlated assets (DXY, VIX, yields) are flipped — e.g. a rising dollar produces a negative BTC signal.
+            VIX uses absolute level bands rather than daily change. Weights reflect empirical correlation strength with BTC over recent market regimes.
+            This is a directional bias indicator, not a trade signal. Always combine with your own analysis.
+          </p>
+        </div>
+      );
+    }
+
+    // =============================================
+    // MAIN APP
+    // =============================================
+    function App() {
+      const [btcData, setBtcData] = useState(null);
+      const [fearGreed, setFearGreed] = useState(null);
+      const [markets, setMarkets] = useState({});
+      const [loading, setLoading] = useState(true);
+      const [lastUpdate, setLastUpdate] = useState(null);
+      const [liveCount, setLiveCount] = useState(0);
+      const [demoMode, setDemoMode] = useState(false);
+      const [error, setError] = useState(null);
+      const refreshInterval = useRef(null);
+
+      const loadData = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+
+        try {
+          const [btc, fg, mkt] = await Promise.allSettled([
+            fetchBTC(),
+            fetchFearGreed(),
+            fetchAllTraditionalMarkets(),
+          ]);
+
+          const btcResult = btc.status === 'fulfilled' ? btc.value : null;
+          const fgResult = fg.status === 'fulfilled' ? fg.value : null;
+          const mktResult = mkt.status === 'fulfilled' ? mkt.value : {};
+
+          // Count live data sources
+          let live = 0;
+          if (btcResult?.live) live++;
+          if (fgResult?.live) live++;
+          Object.values(mktResult).forEach(m => { if (m?.live) live++; });
+
+          // If we got almost nothing live, fall back to demo
+          if (live <= 1) {
+            const demo = getDemoData();
+            setBtcData(btcResult || demo.btc);
+            setFearGreed(fgResult || demo.fearGreed);
+            setMarkets({ ...demo.markets, ...Object.fromEntries(Object.entries(mktResult).filter(([_, v]) => v)) });
+            setDemoMode(live === 0);
+            setLiveCount(live);
+          } else {
+            setBtcData(btcResult || getDemoData().btc);
+            setFearGreed(fgResult || getDemoData().fearGreed);
+            setMarkets(Object.fromEntries(
+              Object.entries(SCORING_CONFIG)
+                .filter(([k]) => k !== 'btcMom')
+                .map(([k]) => [k, mktResult[k] || getDemoData().markets[k]])
+            ));
+            setDemoMode(false);
+            setLiveCount(live);
+          }
+
+          setLastUpdate(new Date());
+        } catch (e) {
+          console.error('Data fetch error:', e);
+          const demo = getDemoData();
+          setBtcData(demo.btc);
+          setFearGreed(demo.fearGreed);
+          setMarkets(demo.markets);
+          setDemoMode(true);
+          setLastUpdate(new Date());
+          setError('Using demo data — live APIs unreachable');
+        }
+
+        setLoading(false);
+      }, []);
+
+      useEffect(() => {
+        loadData();
+        refreshInterval.current = setInterval(loadData, 5 * 60 * 1000); // refresh every 5 min
+        return () => clearInterval(refreshInterval.current);
+      }, [loadData]);
+
+      const signals = useMemo(() => {
+        if (!btcData) return {};
+        return computeSignals(markets, btcData);
+      }, [markets, btcData]);
+
+      const score = useMemo(() => {
+        return computeFinalScore(signals);
+      }, [signals]);
+
+      const summary = useMemo(() => {
+        if (Object.keys(signals).length === 0) return '';
+        return generateSummary(signals, score, btcData, fearGreed);
+      }, [signals, score, btcData, fearGreed]);
+
+      return (
+        <div className="max-w-6xl mx-auto px-4 py-6">
+          {/* Header */}
+          <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-3">
+            <div>
+              <h1 className="text-2xl font-bold text-white tracking-tight">
+                <span className="text-orange-400">BTC</span> Macro Pulse
+              </h1>
+              <p className="text-xs text-gray-500 mt-0.5 font-mono">Cross-Market Sentiment Engine</p>
+            </div>
+            <div className="flex items-center gap-4 text-xs font-mono">
+              {demoMode && (
+                <span className="px-2 py-1 bg-yellow-900/40 text-yellow-500 rounded border border-yellow-800/50">
+                  DEMO DATA
+                </span>
+              )}
+              {!demoMode && liveCount > 0 && (
+                <span className="flex items-center gap-1.5 px-2 py-1 bg-green-900/30 text-green-400 rounded border border-green-800/50">
+                  <span className="w-1.5 h-1.5 bg-green-500 rounded-full live-dot"></span>
+                  {liveCount} LIVE
+                </span>
+              )}
+              {lastUpdate && (
+                <span className="text-gray-600">
+                  Updated {lastUpdate.toLocaleTimeString()}
+                </span>
+              )}
+              <button
+                onClick={loadData}
+                disabled={loading}
+                className="px-3 py-1 bg-terminal-card border border-terminal-border rounded text-gray-400 hover:text-white hover:border-gray-600 transition disabled:opacity-50"
+              >
+                {loading ? 'Loading...' : 'Refresh'}
+              </button>
+            </div>
+          </header>
+
+          {error && (
+            <div className="mb-4 px-4 py-2 bg-yellow-900/20 border border-yellow-800/40 rounded text-yellow-500 text-xs font-mono">
+              {error}
+            </div>
+          )}
+
+          {/* Score Hero */}
+          <section className="bg-terminal-card border border-terminal-border rounded-xl p-6 mb-6">
+            <ScoreHero score={score} summary={summary} loading={loading} />
+          </section>
+
+          {/* BTC + Fear & Greed row */}
+          <section className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <BTCCard btcData={btcData} live={btcData?.live} />
+            <FearGreedCard data={fearGreed} />
+          </section>
+
+          {/* Market Cards Grid */}
+          <section className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
+            {Object.entries(signals).map(([key, s]) => (
+              <MarketCard
+                key={key}
+                label={s.label}
+                price={s.price || (key === 'btcMom' ? btcData?.price : undefined)}
+                change={key === 'btcMom' ? btcData?.change24h : s.change}
+                signal={s.signal}
+                weight={s.weight}
+                inverse={s.inverse}
+                isLevel={s.isLevel}
+                live={markets[key]?.live}
+                missing={s.missing}
+              />
+            ))}
+          </section>
+
+          {/* Signal Breakdown */}
+          <section className="mb-6">
+            <SignalTable signals={signals} />
+          </section>
+
+          {/* Methodology */}
+          <section className="mb-6">
+            <MethodologyNote />
+          </section>
+
+          {/* Footer */}
+          <footer className="text-center text-xs text-gray-700 font-mono py-4 border-t border-terminal-border">
+            BTC Macro Pulse v1.0 &middot; Auto-refreshes every 5 minutes &middot; Not financial advice
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
