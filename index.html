@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BTC Macro Pulse v2 — Cross-Market Sentiment Engine</title>
+  <title>BTC Macro Pulse v3 — Dual-Model Sentiment Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -13,1121 +13,807 @@
   <script>
     tailwind.config = {
       darkMode: 'class',
-      theme: {
-        extend: {
-          fontFamily: { mono: ['JetBrains Mono', 'monospace'], sans: ['Inter', 'sans-serif'] },
-          colors: {
-            terminal: { bg: '#080c14', card: '#0f1724', border: '#1a2540', highlight: '#1e3a5f' },
-            bull: { light: '#4ade80', DEFAULT: '#22c55e', dark: '#15803d' },
-            bear: { light: '#f87171', DEFAULT: '#ef4444', dark: '#b91c1c' },
-            warn: '#f59e0b',
-            session: { asia: '#818cf8', europe: '#38bdf8', us: '#f59e0b', closed: '#374151' }
-          }
+      theme: { extend: {
+        fontFamily: { mono: ['JetBrains Mono', 'monospace'], sans: ['Inter', 'sans-serif'] },
+        colors: {
+          terminal: { bg: '#080c14', card: '#0f1724', border: '#1a2540', highlight: '#1e3a5f' },
+          bull: { light: '#4ade80', DEFAULT: '#22c55e', dark: '#15803d' },
+          bear: { light: '#f87171', DEFAULT: '#ef4444', dark: '#b91c1c' },
+          warn: '#f59e0b',
+          session: { asia: '#818cf8', europe: '#38bdf8', us: '#f59e0b' }
         }
-      }
+      }}
     }
   </script>
   <style>
     body { background: #080c14; }
-    @keyframes pulse-glow { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
-    @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-    .animate-fade-in { animation: fade-in 0.5s ease-out forwards; }
-    .card-hover { transition: all 0.2s ease; }
-    .card-hover:hover { background: #162033; border-color: #2a4060; transform: translateY(-1px); }
-    .live-dot { animation: pulse-glow 2s ease-in-out infinite; }
-    .stale-overlay { position: relative; }
-    .stale-overlay::after { content: ''; position: absolute; inset: 0; background: rgba(8,12,20,0.4); border-radius: inherit; pointer-events: none; }
-    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #0f1724; } ::-webkit-scrollbar-thumb { background: #1a2540; border-radius: 3px; }
+    @keyframes pulse-glow { 0%,100% { opacity:.6 } 50% { opacity:1 } }
+    @keyframes fade-in { from { opacity:0;transform:translateY(8px) } to { opacity:1;transform:translateY(0) } }
+    .animate-fade-in { animation: fade-in .5s ease-out forwards }
+    .card-hover { transition: all .2s ease } .card-hover:hover { background:#162033;border-color:#2a4060;transform:translateY(-1px) }
+    .live-dot { animation: pulse-glow 2s ease-in-out infinite }
+    .stale-overlay { position:relative } .stale-overlay::after { content:'';position:absolute;inset:0;background:rgba(8,12,20,.4);border-radius:inherit;pointer-events:none }
+    ::-webkit-scrollbar { width:6px } ::-webkit-scrollbar-track { background:#0f1724 } ::-webkit-scrollbar-thumb { background:#1a2540;border-radius:3px }
   </style>
 </head>
 <body class="min-h-screen text-gray-100 antialiased font-sans">
-  <div id="root"></div>
-
-  <script type="text/babel">
-    const { useState, useEffect, useMemo, useCallback, useRef } = React;
-
-    // =============================================
-    // SESSION & MARKET HOURS ENGINE
-    // =============================================
-    // All times in UTC hours (0-24)
-    const SESSIONS = {
-      asia:   { label: 'Asian Session',    start: 0,    end: 8,    color: '#818cf8' },
-      europe: { label: 'European Session', start: 8,    end: 13.5, color: '#38bdf8' },
-      us:     { label: 'US Session',       start: 13.5, end: 21,   color: '#f59e0b' },
-      trans:  { label: 'Transition',       start: 21,   end: 24,   color: '#6b7280' },
-    };
-
-    // Market trading hours (UTC). Futures trade ~23h/day weekdays.
-    const MARKET_HOURS = {
-      es_futures:   { label: 'S&P Futures',    openH: 23, closeH: 22, isFutures: true },
-      nq_futures:   { label: 'Nasdaq Futures',  openH: 23, closeH: 22, isFutures: true },
-      gold_futures: { label: 'Gold Futures',    openH: 23, closeH: 22, isFutures: true },
-      forex:        { label: 'Forex (DXY)',     openH: 22, closeH: 22, isFutures: true },
-      vix:          { label: 'VIX',             openH: 14.5, closeH: 21.25, isFutures: false },
-      bonds:        { label: '10Y Yield',       openH: 14.5, closeH: 21, isFutures: false },
-      crypto:       { label: 'Crypto',          alwaysOpen: true },
-    };
-
-    function getCurrentSessionInfo() {
-      const now = new Date();
-      const utcH = now.getUTCHours() + now.getUTCMinutes() / 60;
-      const dayOfWeek = now.getUTCDay(); // 0=Sun, 6=Sat
-      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-
-      let session = 'trans';
-      for (const [key, s] of Object.entries(SESSIONS)) {
-        if (utcH >= s.start && utcH < s.end) { session = key; break; }
-      }
-
-      // Check which markets are currently open
-      const marketsOpen = {};
-      for (const [key, m] of Object.entries(MARKET_HOURS)) {
-        if (m.alwaysOpen) { marketsOpen[key] = true; continue; }
-        if (isWeekend) { marketsOpen[key] = false; continue; }
-        if (m.isFutures) {
-          // Futures: open ~23h/day with 1h break. Simplified: open weekdays except 22:00-23:00 UTC
-          marketsOpen[key] = !(utcH >= 22 && utcH < 23);
-        } else {
-          marketsOpen[key] = utcH >= m.openH && utcH < m.closeH;
-        }
-      }
-
-      return { session, utcHour: utcH, dayOfWeek, isWeekend, marketsOpen, timestamp: now };
-    }
-
-    // Session relevance: how much should we trust TradFi signals in this session?
-    // Returns multiplier 0-1 for each signal category
-    function getSessionRelevance(signalKey, sessionInfo) {
-      const { session, isWeekend, marketsOpen } = sessionInfo;
-
-      // Crypto signals always fully relevant
-      if (['btcMom4h', 'btcMom24h', 'ethBtc', 'fearGreed'].includes(signalKey)) return 1.0;
-
-      if (isWeekend) return 0.1; // TradFi mostly irrelevant on weekends
-
-      // Map signal keys to market keys
-      const signalToMarket = {
-        sp500: 'es_futures', nasdaq: 'nq_futures', gold: 'gold_futures',
-        dxy: 'forex', vix: 'vix', tenYear: 'bonds',
-      };
-
-      const marketKey = signalToMarket[signalKey];
-      if (!marketKey) return 0.5;
-
-      // If market is open, full relevance
-      if (marketsOpen[marketKey]) return 1.0;
-
-      // If market is closed, reduced relevance by session
-      const sessionRelevance = { asia: 0.3, europe: 0.5, us: 1.0, trans: 0.4 };
-      return sessionRelevance[session] || 0.3;
-    }
-
-    // =============================================
-    // FRESHNESS / DECAY ENGINE
-    // =============================================
-    function calculateFreshness4h(dataAgeHours) {
-      if (dataAgeHours == null || isNaN(dataAgeHours)) return 0.5;
-      if (dataAgeHours < 0.5) return 1.0;
-      if (dataAgeHours < 1)   return 0.85;
-      if (dataAgeHours < 2)   return 0.65;
-      if (dataAgeHours < 4)   return 0.35;
-      if (dataAgeHours < 8)   return 0.15;
-      return 0.05;
-    }
-
-    function calculateFreshness24h(dataAgeHours) {
-      if (dataAgeHours == null || isNaN(dataAgeHours)) return 0.5;
-      if (dataAgeHours < 1)   return 1.0;
-      if (dataAgeHours < 4)   return 0.9;
-      if (dataAgeHours < 8)   return 0.75;
-      if (dataAgeHours < 16)  return 0.55;
-      if (dataAgeHours < 24)  return 0.35;
-      return 0.15;
-    }
-
-    function formatDataAge(ageHours) {
-      if (ageHours == null) return 'unknown';
-      if (ageHours < 0.05) return 'just now';
-      if (ageHours < 1) return `${Math.round(ageHours * 60)}m ago`;
-      if (ageHours < 24) return `${Math.round(ageHours)}h ago`;
-      return `${Math.round(ageHours / 24)}d ago`;
-    }
-
-    // =============================================
-    // SIGNAL CONFIGURATION
-    // =============================================
-    const SIGNAL_CONFIG = {
-      sp500:    { baseWeight: 0.16, inverse: false, label: 'S&P 500 Futures',   typicalRange: 1.0,  category: 'tradfi', yahoo: 'ES%3DF' },
-      nasdaq:   { baseWeight: 0.12, inverse: false, label: 'Nasdaq Futures',    typicalRange: 1.3,  category: 'tradfi', yahoo: 'NQ%3DF' },
-      gold:     { baseWeight: 0.08, inverse: false, label: 'Gold Futures',      typicalRange: 0.8,  category: 'tradfi', yahoo: 'GC%3DF' },
-      dxy:      { baseWeight: 0.14, inverse: true,  label: 'US Dollar (DXY)',   typicalRange: 0.4,  category: 'tradfi', yahoo: 'DX-Y.NYB' },
-      vix:      { baseWeight: 0.10, inverse: true,  label: 'VIX',              typicalRange: 5.0,  category: 'tradfi', yahoo: '%5EVIX', isLevel: true },
-      tenYear:  { baseWeight: 0.07, inverse: true,  label: '10Y Yield',        typicalRange: 2.0,  category: 'tradfi', yahoo: '%5ETNX' },
-      btcMom4h: { baseWeight: 0.12, inverse: false, label: 'BTC 4h Momentum',  typicalRange: 2.0,  category: 'crypto' },
-      btcMom24h:{ baseWeight: 0.08, inverse: false, label: 'BTC 24h Momentum', typicalRange: 4.0,  category: 'crypto' },
-      ethBtc:   { baseWeight: 0.06, inverse: false, label: 'ETH/BTC Trend',    typicalRange: 2.0,  category: 'crypto' },
-      fearGreed:{ baseWeight: 0.07, inverse: false, label: 'Fear & Greed',     typicalRange: 50,   category: 'crypto', isLevel: true },
-    };
-
-    // =============================================
-    // API LAYER
-    // =============================================
-    const PROXY_CHAINS = [
-      (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-      (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    ];
-
-    async function fetchWithProxy(url) {
-      for (const makeProxy of PROXY_CHAINS) {
-        try {
-          const res = await fetch(makeProxy(url), { signal: AbortSignal.timeout(10000) });
-          if (res.ok) { return JSON.parse(await res.text()); }
-        } catch (e) { /* try next */ }
-      }
-      return null;
-    }
-
-    async function fetchBTCHourly() {
-      try {
-        const res = await fetch('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1');
-        if (!res.ok) throw new Error('CoinGecko error');
-        const data = await res.json();
-        const prices = data.prices; // [[timestamp, price], ...]
-        if (!prices || prices.length < 2) return null;
-
-        const latest = prices[prices.length - 1];
-        const now = Date.now();
-
-        // Find price ~4 hours ago
-        const target4h = now - 4 * 3600 * 1000;
-        let price4hAgo = prices[0];
-        for (const p of prices) {
-          if (Math.abs(p[0] - target4h) < Math.abs(price4hAgo[0] - target4h)) price4hAgo = p;
-        }
-
-        const change4h = ((latest[1] - price4hAgo[1]) / price4hAgo[1]) * 100;
-        const change24h = ((latest[1] - prices[0][1]) / prices[0][1]) * 100;
-
-        // Extract recent prices for sparkline (last 24h, hourly)
-        const sparkline = prices.filter((_, i) => i % Math.max(1, Math.floor(prices.length / 24)) === 0).map(p => p[1]);
-
-        return {
-          price: latest[1],
-          change4h,
-          change24h,
-          volume: null,
-          marketCap: null,
-          sparkline,
-          live: true,
-          timestamp: latest[0],
-        };
-      } catch (e) { return null; }
-    }
-
-    async function fetchBTCBasic() {
-      try {
-        const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true');
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        return {
-          price: data.bitcoin.usd,
-          change24h: data.bitcoin.usd_24h_change,
-          volume: data.bitcoin.usd_24h_vol,
-          marketCap: data.bitcoin.usd_market_cap,
-          live: true,
-        };
-      } catch (e) { return null; }
-    }
-
-    async function fetchETHBTC() {
-      try {
-        const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=btc,usd&include_24hr_change=true');
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        return {
-          priceBtc: data.ethereum.btc,
-          priceUsd: data.ethereum.usd,
-          change24h: data.ethereum.btc_24h_change || 0,
-          live: true,
-          timestamp: Date.now(),
-        };
-      } catch (e) { return null; }
-    }
-
-    async function fetchFearGreed() {
-      try {
-        const res = await fetch('https://api.alternative.me/fng/?limit=1');
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        return {
-          value: parseInt(data.data[0].value),
-          label: data.data[0].value_classification,
-          timestamp: parseInt(data.data[0].timestamp) * 1000,
-          live: true,
-        };
-      } catch (e) { return null; }
-    }
-
-    async function fetchYahooQuote(yahooSymbol) {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1d&range=5d`;
-      const data = await fetchWithProxy(url);
-      if (!data?.chart?.result) return null;
-
-      try {
-        const result = data.chart.result[0];
-        const meta = result.meta;
-        const closes = result.indicators.quote[0].close.filter(c => c !== null);
-        if (closes.length < 2) return null;
-
-        const current = meta.regularMarketPrice || closes[closes.length - 1];
-        const prevClose = meta.chartPreviousClose || closes[closes.length - 2];
-        const change = ((current - prevClose) / prevClose) * 100;
-
-        // regularMarketTime is Unix timestamp of last trade
-        const marketTime = meta.regularMarketTime ? meta.regularMarketTime * 1000 : null;
-        const dataAgeHours = marketTime ? (Date.now() - marketTime) / 3600000 : null;
-
-        return {
-          price: current,
-          prevClose,
-          change,
-          marketTime,
-          dataAgeHours,
-          exchangeName: meta.exchangeName || '',
-          live: true,
-        };
-      } catch (e) { return null; }
-    }
-
-    async function fetchAllMarketData() {
-      const tradfiKeys = Object.entries(SIGNAL_CONFIG).filter(([_, c]) => c.yahoo).map(([k]) => k);
-
-      const tradfiPromises = tradfiKeys.map(async (key) => {
-        const config = SIGNAL_CONFIG[key];
-        return { key, data: await fetchYahooQuote(config.yahoo) };
-      });
-
-      const [btcHourly, btcBasic, ethBtc, fearGreed, ...tradfi] = await Promise.allSettled([
-        fetchBTCHourly(),
-        fetchBTCBasic(),
-        fetchETHBTC(),
-        fetchFearGreed(),
-        ...tradfiPromises.map(p => p),
-      ]);
-
-      const result = {
-        btcHourly: btcHourly.status === 'fulfilled' ? btcHourly.value : null,
-        btcBasic: btcBasic.status === 'fulfilled' ? btcBasic.value : null,
-        ethBtc: ethBtc.status === 'fulfilled' ? ethBtc.value : null,
-        fearGreed: fearGreed.status === 'fulfilled' ? fearGreed.value : null,
-        tradfi: {},
-      };
-
-      for (const t of tradfi) {
-        if (t.status === 'fulfilled' && t.value) {
-          result.tradfi[t.value.key] = t.value.data;
-        }
-      }
-
-      return result;
-    }
-
-    // =============================================
-    // DEMO / FALLBACK DATA
-    // =============================================
-    function getDemoData() {
-      const now = Date.now();
-      return {
-        btcHourly: { price: 97425, change4h: 0.82, change24h: 2.14, sparkline: [95200,95400,95800,96100,96000,96300,96800,97100,96900,97200,97400,97425], live: false, timestamp: now },
-        btcBasic: { price: 97425, change24h: 2.14, volume: 38200000000, marketCap: 1920000000000, live: false },
-        ethBtc: { priceBtc: 0.0271, priceUsd: 2638, change24h: -0.45, live: false, timestamp: now },
-        fearGreed: { value: 72, label: 'Greed', live: false, timestamp: now },
-        tradfi: {
-          sp500:   { price: 6115.80, prevClose: 6078.73, change: 0.61, marketTime: now - 3600000 * 2, dataAgeHours: 2, live: false },
-          nasdaq:  { price: 21890.50, prevClose: 21747.30, change: 0.66, marketTime: now - 3600000 * 2, dataAgeHours: 2, live: false },
-          gold:    { price: 2940.20, prevClose: 2935.40, change: 0.16, marketTime: now - 3600000 * 1, dataAgeHours: 1, live: false },
-          dxy:     { price: 106.55, prevClose: 106.82, change: -0.25, marketTime: now - 3600000 * 1, dataAgeHours: 1, live: false },
-          vix:     { price: 15.42, prevClose: 15.24, change: 1.18, marketTime: now - 3600000 * 4, dataAgeHours: 4, live: false },
-          tenYear: { price: 4.51, prevClose: 4.48, change: 0.67, marketTime: now - 3600000 * 4, dataAgeHours: 4, live: false },
-        },
-      };
-    }
-
-    // =============================================
-    // SCORING ENGINE v2
-    // =============================================
-    function normalizeChange(pctChange, typicalRange) {
-      return Math.max(-100, Math.min(100, (pctChange / typicalRange) * 50));
-    }
-
-    function getVixSignal(level) {
-      if (level < 13) return 50;  if (level < 16) return 30;
-      if (level < 20) return 0;   if (level < 25) return -30;
-      if (level < 30) return -60;  return -85;
-    }
-
-    function getFearGreedSignal(value) {
-      // 0=Extreme Fear, 100=Extreme Greed. Centered at 50.
-      return (value - 50) * 1.5; // -75 to +75 range
-    }
-
-    function computeAllSignals(marketData, sessionInfo) {
-      const { btcHourly, btcBasic, ethBtc, fearGreed, tradfi } = marketData;
-      const signals = {};
-
-      // TradFi signals
-      for (const [key, config] of Object.entries(SIGNAL_CONFIG)) {
-        if (config.category === 'tradfi') {
-          const mktData = tradfi[key];
-          if (!mktData) {
-            signals[key] = { ...config, raw: 0, signal: 0, missing: true, dataAgeHours: null, freshness4h: 0, freshness24h: 0 };
-            continue;
-          }
-
-          let rawSignal;
-          if (config.isLevel) {
-            rawSignal = getVixSignal(mktData.price);
-          } else {
-            rawSignal = normalizeChange(mktData.change, config.typicalRange);
-          }
-          if (config.inverse) rawSignal = -rawSignal;
-
-          const ageH = mktData.dataAgeHours ?? ((Date.now() - (mktData.marketTime || 0)) / 3600000);
-
-          signals[key] = {
-            ...config,
-            raw: config.isLevel ? mktData.price : mktData.change,
-            price: mktData.price,
-            change: mktData.change,
-            signal: rawSignal,
-            dataAgeHours: ageH,
-            freshness4h: calculateFreshness4h(ageH),
-            freshness24h: calculateFreshness24h(ageH),
-            sessionRelevance: getSessionRelevance(key, sessionInfo),
-            marketTime: mktData.marketTime,
-            live: mktData.live,
-          };
-        }
-      }
-
-      // BTC 4h Momentum
-      const btc4h = btcHourly || btcBasic;
-      const change4h = btcHourly?.change4h ?? (btcBasic?.change24h ? btcBasic.change24h / 6 : 0);
-      signals.btcMom4h = {
-        ...SIGNAL_CONFIG.btcMom4h,
-        raw: change4h,
-        signal: normalizeChange(change4h, SIGNAL_CONFIG.btcMom4h.typicalRange),
-        dataAgeHours: 0,
-        freshness4h: 1.0,
-        freshness24h: 1.0,
-        sessionRelevance: 1.0,
-        live: btc4h?.live || false,
-      };
-
-      // BTC 24h Momentum
-      const change24h = btcHourly?.change24h ?? btcBasic?.change24h ?? 0;
-      signals.btcMom24h = {
-        ...SIGNAL_CONFIG.btcMom24h,
-        raw: change24h,
-        signal: normalizeChange(change24h, SIGNAL_CONFIG.btcMom24h.typicalRange),
-        dataAgeHours: 0,
-        freshness4h: 1.0,
-        freshness24h: 1.0,
-        sessionRelevance: 1.0,
-        live: btc4h?.live || false,
-      };
-
-      // ETH/BTC
-      signals.ethBtc = {
-        ...SIGNAL_CONFIG.ethBtc,
-        raw: ethBtc?.change24h ?? 0,
-        price: ethBtc?.priceBtc,
-        signal: normalizeChange(ethBtc?.change24h ?? 0, SIGNAL_CONFIG.ethBtc.typicalRange),
-        dataAgeHours: 0,
-        freshness4h: 1.0,
-        freshness24h: 1.0,
-        sessionRelevance: 1.0,
-        live: ethBtc?.live || false,
-        missing: !ethBtc,
-      };
-
-      // Fear & Greed (as a proper signal)
-      const fgVal = fearGreed?.value ?? 50;
-      signals.fearGreed = {
-        ...SIGNAL_CONFIG.fearGreed,
-        raw: fgVal,
-        signal: getFearGreedSignal(fgVal),
-        fgLabel: fearGreed?.label || 'Unknown',
-        dataAgeHours: 0,
-        freshness4h: 0.8, // F&G updates daily, slightly stale for 4h
-        freshness24h: 1.0,
-        sessionRelevance: 1.0,
-        live: fearGreed?.live || false,
-        isLevel: true,
-        missing: !fearGreed,
-      };
-
-      return signals;
-    }
-
-    function computeScore(signals, timeframe) {
-      // timeframe: '4h' or '24h'
-      const freshnessKey = timeframe === '4h' ? 'freshness4h' : 'freshness24h';
-
-      // Calculate effective weights: base weight * freshness * session relevance, then normalize
-      let totalEffective = 0;
-      const effectiveWeights = {};
-
-      for (const [key, s] of Object.entries(signals)) {
-        if (s.missing) { effectiveWeights[key] = 0; continue; }
-        const ew = s.baseWeight * (s[freshnessKey] ?? 0.5) * (s.sessionRelevance ?? 0.5);
-        effectiveWeights[key] = ew;
-        totalEffective += ew;
-      }
-
-      // Normalize weights to sum to 1
-      if (totalEffective === 0) return { score: 0, weights: effectiveWeights, contributions: {} };
-
-      let score = 0;
-      const contributions = {};
-      for (const [key, s] of Object.entries(signals)) {
-        const normalizedWeight = effectiveWeights[key] / totalEffective;
-        const contribution = s.signal * normalizedWeight;
-        contributions[key] = { weight: normalizedWeight, contribution, signal: s.signal };
-        score += contribution;
-      }
-
-      return {
-        score: Math.round(Math.max(-100, Math.min(100, score))),
-        weights: effectiveWeights,
-        contributions,
-      };
-    }
-
-    // =============================================
-    // DISPLAY HELPERS
-    // =============================================
-    function getScoreLabel(score) {
-      if (score >= 60) return 'Strongly Bullish';
-      if (score >= 30) return 'Bullish';
-      if (score >= 10) return 'Leaning Bullish';
-      if (score >= -10) return 'Neutral';
-      if (score >= -30) return 'Leaning Bearish';
-      if (score >= -60) return 'Bearish';
-      return 'Strongly Bearish';
-    }
-
-    function getScoreColor(score) {
-      if (score >= 40) return '#22c55e';
-      if (score >= 15) return '#4ade80';
-      if (score >= -15) return '#f59e0b';
-      if (score >= -40) return '#f87171';
-      return '#ef4444';
-    }
-
-    function generateSummary(signals, scoreResult, timeframe, sessionInfo) {
-      const { score, contributions } = scoreResult;
-      const tf = timeframe === '4h' ? 'next 4 hours' : 'next 24 hours';
-      const label = score >= 30 ? 'bullish' : score >= 10 ? 'slightly bullish' : score >= -10 ? 'neutral' : score >= -30 ? 'slightly bearish' : 'bearish';
-
-      const ranked = Object.entries(contributions)
-        .filter(([k]) => !signals[k]?.missing)
-        .sort((a, b) => Math.abs(b[1].contribution) - Math.abs(a[1].contribution));
-
-      const bullish = ranked.filter(([_, c]) => c.contribution > 1).slice(0, 3);
-      const bearish = ranked.filter(([_, c]) => c.contribution < -1).slice(0, 2);
-
-      let parts = [`<strong>${label[0].toUpperCase() + label.slice(1)}</strong> outlook for the ${tf}.`];
-
-      if (sessionInfo.isWeekend) {
-        parts.push('Traditional markets closed for the weekend — score driven primarily by crypto-native signals.');
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+// ========================================================
+// SESSION ENGINE (unchanged from v2)
+// ========================================================
+const SESSIONS = {
+  asia:   { label: 'Asian Session',    start: 0,    end: 8,    color: '#818cf8' },
+  europe: { label: 'European Session', start: 8,    end: 13.5, color: '#38bdf8' },
+  us:     { label: 'US Session',       start: 13.5, end: 21,   color: '#f59e0b' },
+  trans:  { label: 'Transition',       start: 21,   end: 24,   color: '#6b7280' },
+};
+const MARKET_HOURS = {
+  es_futures: { isFutures: true }, nq_futures: { isFutures: true },
+  gold_futures: { isFutures: true }, forex: { isFutures: true },
+  vix: { openH: 14.5, closeH: 21.25 }, bonds: { openH: 14.5, closeH: 21 },
+  crypto: { alwaysOpen: true },
+};
+
+function getCurrentSessionInfo() {
+  const now = new Date();
+  const utcH = now.getUTCHours() + now.getUTCMinutes() / 60;
+  const dow = now.getUTCDay();
+  const isWeekend = dow === 0 || dow === 6;
+  let session = 'trans';
+  for (const [k, s] of Object.entries(SESSIONS)) { if (utcH >= s.start && utcH < s.end) { session = k; break; } }
+  const marketsOpen = {};
+  for (const [k, m] of Object.entries(MARKET_HOURS)) {
+    if (m.alwaysOpen) { marketsOpen[k] = true; continue; }
+    if (isWeekend) { marketsOpen[k] = false; continue; }
+    if (m.isFutures) { marketsOpen[k] = !(utcH >= 22 && utcH < 23); }
+    else { marketsOpen[k] = utcH >= m.openH && utcH < m.closeH; }
+  }
+  return { session, utcHour: utcH, dayOfWeek: dow, isWeekend, marketsOpen, timestamp: now };
+}
+
+function getSessionRelevance(category, sessionInfo) {
+  if (category === 'crypto') return 1.0;
+  if (sessionInfo.isWeekend) return 0.1;
+  const m = { asia: 0.35, europe: 0.55, us: 1.0, trans: 0.4 };
+  return m[sessionInfo.session] || 0.3;
+}
+
+// ========================================================
+// FRESHNESS ENGINE (unchanged from v2)
+// ========================================================
+function freshness4h(h) { if(h==null)return .5; if(h<.5)return 1; if(h<1)return .85; if(h<2)return .65; if(h<4)return .35; if(h<8)return .15; return .05; }
+function freshness24h(h) { if(h==null)return .5; if(h<1)return 1; if(h<4)return .9; if(h<8)return .75; if(h<16)return .55; if(h<24)return .35; return .15; }
+function fmtAge(h) { if(h==null)return '?'; if(h<.05)return 'now'; if(h<1)return `${Math.round(h*60)}m`; if(h<24)return `${Math.round(h)}h`; return `${Math.round(h/24)}d`; }
+
+// ========================================================
+// API LAYER
+// ========================================================
+const PROXIES = [
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+];
+async function fetchProxy(url) {
+  for (const p of PROXIES) { try { const r = await fetch(p(url),{signal:AbortSignal.timeout(10000)}); if(r.ok) return JSON.parse(await r.text()); } catch(e){} }
+  return null;
+}
+
+// Yahoo: fetch 5 days of daily data + extract metadata
+async function fetchYahoo(sym) {
+  const d = await fetchProxy(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=5d`);
+  if (!d?.chart?.result) return null;
+  try {
+    const r = d.chart.result[0], m = r.meta, q = r.indicators.quote[0];
+    const closes = q.close.filter(c => c != null);
+    if (closes.length < 2) return null;
+    const cur = m.regularMarketPrice || closes[closes.length-1];
+    const prev = m.chartPreviousClose || closes[closes.length-2];
+    const dailyChg = ((cur - prev) / prev) * 100;
+    const mktTime = m.regularMarketTime ? m.regularMarketTime * 1000 : null;
+    const ageH = mktTime ? (Date.now() - mktTime) / 3600000 : null;
+    // Multi-day trend: avg of last 3 closes vs avg of previous 2
+    const recent3 = closes.slice(-3);
+    const older2 = closes.slice(0, Math.max(1, closes.length - 3));
+    const avgRecent = recent3.reduce((a,b)=>a+b,0) / recent3.length;
+    const avgOlder = older2.reduce((a,b)=>a+b,0) / older2.length;
+    const multiDayTrend = ((avgRecent - avgOlder) / avgOlder) * 100;
+    // Range position in 5d
+    const allCloses = closes;
+    const hi = Math.max(...allCloses), lo = Math.min(...allCloses);
+    const rangePos = hi === lo ? 50 : ((cur - lo) / (hi - lo)) * 100;
+    return { price: cur, prevClose: prev, dailyChg, multiDayTrend, rangePos, marketTime: mktTime, ageH, live: true };
+  } catch(e) { return null; }
+}
+
+// BTC: 7 days hourly for trend, range, and 4h momentum
+async function fetchBTC7d() {
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7');
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    const prices = d.prices;
+    if (!prices || prices.length < 10) return null;
+    const latest = prices[prices.length-1];
+    const now = Date.now();
+
+    // 4h change
+    const t4 = now - 4*3600000;
+    let p4 = prices[0];
+    for (const p of prices) { if (Math.abs(p[0]-t4) < Math.abs(p4[0]-t4)) p4 = p; }
+    const chg4h = ((latest[1] - p4[1]) / p4[1]) * 100;
+
+    // 24h change
+    const t24 = now - 24*3600000;
+    let p24 = prices[0];
+    for (const p of prices) { if (Math.abs(p[0]-t24) < Math.abs(p24[0]-t24)) p24 = p; }
+    const chg24h = ((latest[1] - p24[1]) / p24[1]) * 100;
+
+    // 7d change
+    const chg7d = ((latest[1] - prices[0][1]) / prices[0][1]) * 100;
+
+    // 3-day trend: avg of last 72h vs avg of hours 72-168 ago
+    const last72h = prices.filter(p => p[0] > now - 72*3600000).map(p => p[1]);
+    const prev4d = prices.filter(p => p[0] <= now - 72*3600000).map(p => p[1]);
+    const avgRecent = last72h.length ? last72h.reduce((a,b)=>a+b,0)/last72h.length : latest[1];
+    const avgOlder = prev4d.length ? prev4d.reduce((a,b)=>a+b,0)/prev4d.length : latest[1];
+    const multiDayTrend = ((avgRecent - avgOlder) / avgOlder) * 100;
+
+    // 7d range position
+    const allP = prices.map(p => p[1]);
+    const hi = Math.max(...allP), lo = Math.min(...allP);
+    const rangePos = hi === lo ? 50 : ((latest[1] - lo) / (hi - lo)) * 100;
+
+    // Acceleration: is 4h move faster or slower than what 24h trend would imply?
+    const implied4h = chg24h / 6; // what a steady 24h trend would produce in 4h
+    const acceleration = chg4h - implied4h; // positive = accelerating up
+
+    // Sparkline (24h)
+    const last24 = prices.filter(p => p[0] > now - 24*3600000);
+    const spark = last24.filter((_,i) => i % Math.max(1, Math.floor(last24.length/24)) === 0).map(p => p[1]);
+
+    return { price: latest[1], chg4h, chg24h, chg7d, multiDayTrend, rangePos, acceleration, sparkline: spark, live: true, timestamp: latest[0] };
+  } catch(e) { return null; }
+}
+
+async function fetchBTCBasic() {
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true');
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    return { price: d.bitcoin.usd, change24h: d.bitcoin.usd_24h_change, volume: d.bitcoin.usd_24h_vol, marketCap: d.bitcoin.usd_market_cap, live: true };
+  } catch(e) { return null; }
+}
+
+async function fetchETHBTC() {
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=btc,usd&include_24hr_change=true');
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    return { priceBtc: d.ethereum.btc, priceUsd: d.ethereum.usd, change24h: d.ethereum.btc_24h_change || 0, live: true };
+  } catch(e) { return null; }
+}
+
+async function fetchFearGreed() {
+  try {
+    const r = await fetch('https://api.alternative.me/fng/?limit=2');
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    const today = d.data[0], yesterday = d.data[1];
+    return { value: parseInt(today.value), label: today.value_classification, prevValue: yesterday ? parseInt(yesterday.value) : null, live: true };
+  } catch(e) { return null; }
+}
+
+const YAHOO_SYMS = {
+  sp500: 'ES%3DF', nasdaq: 'NQ%3DF', gold: 'GC%3DF',
+  dxy: 'DX-Y.NYB', vix: '%5EVIX', tenYear: '%5ETNX',
+};
+
+async function fetchAll() {
+  const yahooProms = Object.entries(YAHOO_SYMS).map(async ([k,s]) => ({ key: k, data: await fetchYahoo(s) }));
+  const [btc7d, btcBasic, ethBtc, fg, ...yResults] = await Promise.allSettled([
+    fetchBTC7d(), fetchBTCBasic(), fetchETHBTC(), fetchFearGreed(), ...yahooProms,
+  ]);
+  const tradfi = {};
+  for (const y of yResults) { if (y.status==='fulfilled' && y.value) tradfi[y.value.key] = y.value.data; }
+  return {
+    btc7d: btc7d.status==='fulfilled' ? btc7d.value : null,
+    btcBasic: btcBasic.status==='fulfilled' ? btcBasic.value : null,
+    ethBtc: ethBtc.status==='fulfilled' ? ethBtc.value : null,
+    fearGreed: fg.status==='fulfilled' ? fg.value : null,
+    tradfi,
+  };
+}
+
+// ========================================================
+// DEMO DATA
+// ========================================================
+function demoData() {
+  const n = Date.now();
+  return {
+    btc7d: { price:97425, chg4h:0.82, chg24h:2.14, chg7d:5.3, multiDayTrend:2.1, rangePos:72, acceleration:0.46, sparkline:[95200,95800,96100,96300,96800,97100,96900,97200,97425], live:false, timestamp:n },
+    btcBasic: { price:97425, change24h:2.14, volume:38200000000, marketCap:1920000000000, live:false },
+    ethBtc: { priceBtc:0.0271, priceUsd:2638, change24h:-0.45, live:false },
+    fearGreed: { value:72, label:'Greed', prevValue:68, live:false },
+    tradfi: {
+      sp500:  { price:6115.80, prevClose:6078.73, dailyChg:0.61, multiDayTrend:1.2, rangePos:78, marketTime:n-7200000, ageH:2, live:false },
+      nasdaq: { price:21890.50, prevClose:21747.30, dailyChg:0.66, multiDayTrend:1.5, rangePos:81, marketTime:n-7200000, ageH:2, live:false },
+      gold:   { price:2940.20, prevClose:2935.40, dailyChg:0.16, multiDayTrend:0.8, rangePos:65, marketTime:n-3600000, ageH:1, live:false },
+      dxy:    { price:106.55, prevClose:106.82, dailyChg:-0.25, multiDayTrend:-0.4, rangePos:35, marketTime:n-3600000, ageH:1, live:false },
+      vix:    { price:15.42, prevClose:15.24, dailyChg:1.18, multiDayTrend:-2.1, rangePos:30, marketTime:n-14400000, ageH:4, live:false },
+      tenYear:{ price:4.51, prevClose:4.48, dailyChg:0.67, multiDayTrend:0.3, rangePos:60, marketTime:n-14400000, ageH:4, live:false },
+    },
+  };
+}
+
+// ========================================================
+// v3 SCORING ENGINE — Two fundamentally different models
+// ========================================================
+// Normalise a value to -100..+100 given a typical range
+const norm = (v, range) => Math.max(-100, Math.min(100, (v / range) * 50));
+
+// ---- 4-HOUR MODEL: "Tactical Momentum" ----
+// Asks: what is the SHORT-TERM flow direction right now?
+// Uses: recent changes, acceleration, momentum
+function derive4hSignals(data, session) {
+  const { btc7d, btcBasic, ethBtc, fearGreed, tradfi } = data;
+  const btc = btc7d || btcBasic;
+  const signals = [];
+  const sesRel = getSessionRelevance('crypto', session);
+  const tradRel = getSessionRelevance('tradfi', session);
+
+  // 1. BTC 4h momentum — THE dominant signal for short-term
+  const chg4h = btc7d?.chg4h ?? (btcBasic?.change24h ? btcBasic.change24h / 6 : 0);
+  signals.push({
+    key: 'btc_4h_mom', label: 'BTC 4h Momentum', category: 'crypto',
+    raw: chg4h, display: `${chg4h>=0?'+':''}${chg4h.toFixed(2)}%`,
+    score: norm(chg4h, 2.0), weight: 0.22,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  // 2. BTC acceleration — is the move speeding up or fading?
+  const accel = btc7d?.acceleration ?? 0;
+  signals.push({
+    key: 'btc_accel', label: 'BTC Acceleration', category: 'crypto',
+    raw: accel, display: accel >= 0 ? 'Accelerating' : 'Decelerating',
+    score: norm(accel, 1.5), weight: 0.10,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  // 3. BTC range position as momentum — near highs = continuation, near lows = selling pressure
+  // For 4h: interpret as mean-reversion risk at extremes
+  const rp = btc7d?.rangePos ?? 50;
+  const rpScore4h = rp > 85 ? -15 : rp > 60 ? norm(rp - 50, 40) : rp > 40 ? 0 : rp > 15 ? norm(rp - 50, 40) : 15;
+  signals.push({
+    key: 'btc_range_4h', label: 'BTC Range Position', category: 'crypto',
+    raw: rp, display: `${rp.toFixed(0)}% of 7d range`,
+    score: rpScore4h, weight: 0.06,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  // 4-7. TradFi MOMENTUM signals (daily change, weighted by freshness)
+  const tradfiConf = [
+    { key: 'sp500', label: 'S&P 500 Futures', w: 0.14, inv: false, range: 1.0, mkt: 'es_futures' },
+    { key: 'nasdaq', label: 'Nasdaq Futures', w: 0.10, inv: false, range: 1.3, mkt: 'nq_futures' },
+    { key: 'dxy', label: 'DXY (Dollar)', w: 0.14, inv: true, range: 0.4, mkt: 'forex' },
+    { key: 'gold', label: 'Gold Futures', w: 0.06, inv: false, range: 0.8, mkt: 'gold_futures' },
+  ];
+  for (const c of tradfiConf) {
+    const d = tradfi[c.key];
+    if (!d) { signals.push({ key: c.key+'_4h', label: c.label, category:'tradfi', missing: true, weight: c.w }); continue; }
+    let s = norm(d.dailyChg, c.range);
+    if (c.inv) s = -s;
+    signals.push({
+      key: c.key+'_4h', label: c.label, category: 'tradfi',
+      raw: d.dailyChg, display: `${d.dailyChg>=0?'+':''}${d.dailyChg.toFixed(2)}%`, price: d.price,
+      score: s, weight: c.w,
+      freshness: freshness4h(d.ageH), relevance: tradRel, ageH: d.ageH, live: d.live,
+    });
+  }
+
+  // 8. VIX change direction — for 4h, we care if fear is RISING or FALLING
+  const vd = tradfi.vix;
+  if (vd) {
+    const vixChgScore = norm(-vd.dailyChg, 5.0); // VIX up = bearish, so invert
+    signals.push({
+      key: 'vix_4h', label: 'VIX Direction', category: 'tradfi',
+      raw: vd.dailyChg, display: `${vd.dailyChg>=0?'+':''}${vd.dailyChg.toFixed(2)}% (${vd.price.toFixed(1)})`, price: vd.price,
+      score: vixChgScore, weight: 0.08,
+      freshness: freshness4h(vd.ageH), relevance: tradRel, ageH: vd.ageH, live: vd.live,
+    });
+  } else {
+    signals.push({ key: 'vix_4h', label: 'VIX Direction', category:'tradfi', missing: true, weight: 0.08 });
+  }
+
+  // 9. ETH/BTC — crypto risk appetite
+  if (ethBtc) {
+    signals.push({
+      key: 'ethbtc_4h', label: 'ETH/BTC Flow', category: 'crypto',
+      raw: ethBtc.change24h, display: `${ethBtc.change24h>=0?'+':''}${ethBtc.change24h.toFixed(2)}%`,
+      score: norm(ethBtc.change24h, 2.0), weight: 0.06,
+      freshness: 1.0, relevance: sesRel, price: ethBtc.priceBtc, live: ethBtc.live,
+    });
+  } else {
+    signals.push({ key: 'ethbtc_4h', label: 'ETH/BTC Flow', category:'crypto', missing: true, weight: 0.06 });
+  }
+
+  // 10. Fear & Greed change direction — is sentiment shifting?
+  if (fearGreed && fearGreed.prevValue != null) {
+    const fgChg = fearGreed.value - fearGreed.prevValue;
+    signals.push({
+      key: 'fg_4h', label: 'Sentiment Shift', category: 'crypto',
+      raw: fgChg, display: `${fgChg>=0?'+':''}${fgChg} (${fearGreed.value} ${fearGreed.label})`,
+      score: norm(fgChg, 10), weight: 0.04,
+      freshness: 0.8, relevance: sesRel, live: fearGreed.live,
+    });
+  } else {
+    signals.push({ key: 'fg_4h', label: 'Sentiment Shift', category:'crypto', missing: !fearGreed, weight: 0.04,
+      raw: fearGreed?.value, display: fearGreed ? `${fearGreed.value} ${fearGreed.label}` : '—',
+      score: fearGreed ? (fearGreed.value - 50) * 0.8 : 0, freshness: 0.8, relevance: sesRel, live: fearGreed?.live,
+    });
+  }
+
+  return signals;
+}
+
+// ---- 24-HOUR MODEL: "Macro Regime" ----
+// Asks: what is the BROADER ENVIRONMENT and direction?
+// Uses: levels, multi-day trends, regime indicators, range position
+function derive24hSignals(data, session) {
+  const { btc7d, btcBasic, ethBtc, fearGreed, tradfi } = data;
+  const btc = btc7d || btcBasic;
+  const signals = [];
+  const sesRel = getSessionRelevance('crypto', session);
+  const tradRel = getSessionRelevance('tradfi', session);
+
+  // 1. BTC 24h momentum — moderate weight, this is background context
+  const chg24h = btc7d?.chg24h ?? btcBasic?.change24h ?? 0;
+  signals.push({
+    key: 'btc_24h_mom', label: 'BTC 24h Change', category: 'crypto',
+    raw: chg24h, display: `${chg24h>=0?'+':''}${chg24h.toFixed(2)}%`,
+    score: norm(chg24h, 4.0), weight: 0.08,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  // 2. BTC multi-day trend direction — is the 3-day trend up or down?
+  const trend = btc7d?.multiDayTrend ?? 0;
+  signals.push({
+    key: 'btc_trend', label: 'BTC Multi-Day Trend', category: 'crypto',
+    raw: trend, display: trend > 0.5 ? 'Uptrend' : trend < -0.5 ? 'Downtrend' : 'Flat',
+    score: norm(trend, 3.0), weight: 0.12,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  // 3. BTC 7d range position — for 24h, high = trend strength, low = trend weakness
+  const rp = btc7d?.rangePos ?? 50;
+  const rpScore24h = norm(rp - 50, 50); // linear: 100→+50, 50→0, 0→-50
+  signals.push({
+    key: 'btc_range_24h', label: 'BTC Range Position', category: 'crypto',
+    raw: rp, display: `${rp.toFixed(0)}% of 7d range`,
+    score: rpScore24h, weight: 0.06,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  // 4-8. TradFi REGIME signals: daily change + multi-day trend blended
+  const tradfiConf = [
+    { key: 'sp500', label: 'S&P 500 Regime', w: 0.12, inv: false, range: 1.0, tRange: 1.5 },
+    { key: 'nasdaq', label: 'Nasdaq Regime', w: 0.08, inv: false, range: 1.3, tRange: 2.0 },
+    { key: 'dxy', label: 'DXY Regime', w: 0.12, inv: true, range: 0.4, tRange: 0.6 },
+    { key: 'gold', label: 'Gold Regime', w: 0.06, inv: false, range: 0.8, tRange: 1.2 },
+    { key: 'tenYear', label: '10Y Yield Regime', w: 0.06, inv: true, range: 2.0, tRange: 3.0 },
+  ];
+  for (const c of tradfiConf) {
+    const d = tradfi[c.key];
+    if (!d) { signals.push({ key: c.key+'_24h', label: c.label, category:'tradfi', missing: true, weight: c.w }); continue; }
+    // Blend: 60% multi-day trend + 40% daily change
+    const dailySig = norm(d.dailyChg, c.range);
+    const trendSig = norm(d.multiDayTrend, c.tRange);
+    let blended = dailySig * 0.4 + trendSig * 0.6;
+    if (c.inv) blended = -blended;
+    const trendDir = d.multiDayTrend > 0.1 ? 'up' : d.multiDayTrend < -0.1 ? 'down' : 'flat';
+    signals.push({
+      key: c.key+'_24h', label: c.label, category: 'tradfi',
+      raw: d.dailyChg, display: `${d.dailyChg>=0?'+':''}${d.dailyChg.toFixed(2)}% / trend ${trendDir}`, price: d.price,
+      score: blended, weight: c.w,
+      freshness: freshness24h(d.ageH), relevance: tradRel, ageH: d.ageH, live: d.live,
+      trend: d.multiDayTrend, rangePos: d.rangePos,
+    });
+  }
+
+  // 9. VIX LEVEL regime — for 24h, absolute level matters more than direction
+  const vd = tradfi.vix;
+  if (vd) {
+    const vixLevel = vd.price;
+    const vixLevelScore = vixLevel < 13 ? 50 : vixLevel < 16 ? 30 : vixLevel < 20 ? 0 : vixLevel < 25 ? -30 : vixLevel < 30 ? -60 : -85;
+    signals.push({
+      key: 'vix_24h', label: 'VIX Regime', category: 'tradfi',
+      raw: vixLevel, display: `${vixLevel.toFixed(1)} (${vixLevel<16?'Low fear':vixLevel<20?'Normal':vixLevel<25?'Elevated':vixLevel<30?'High fear':'Extreme fear'})`, price: vd.price,
+      score: vixLevelScore, weight: 0.10,
+      freshness: freshness24h(vd.ageH), relevance: tradRel, ageH: vd.ageH, live: vd.live,
+    });
+  } else {
+    signals.push({ key: 'vix_24h', label: 'VIX Regime', category:'tradfi', missing: true, weight: 0.10 });
+  }
+
+  // 10. ETH/BTC trend
+  if (ethBtc) {
+    signals.push({
+      key: 'ethbtc_24h', label: 'ETH/BTC Trend', category: 'crypto',
+      raw: ethBtc.change24h, display: `${ethBtc.change24h>=0?'+':''}${ethBtc.change24h.toFixed(2)}%`,
+      score: norm(ethBtc.change24h, 2.5), weight: 0.06,
+      freshness: 1.0, relevance: sesRel, price: ethBtc.priceBtc, live: ethBtc.live,
+    });
+  } else {
+    signals.push({ key: 'ethbtc_24h', label: 'ETH/BTC Trend', category:'crypto', missing: true, weight: 0.06 });
+  }
+
+  // 11. Fear & Greed absolute level — for 24h, the level tells us the regime
+  if (fearGreed) {
+    signals.push({
+      key: 'fg_24h', label: 'Sentiment Regime', category: 'crypto',
+      raw: fearGreed.value, display: `${fearGreed.value} — ${fearGreed.label}`,
+      score: (fearGreed.value - 50) * 1.2, weight: 0.08,
+      freshness: 1.0, relevance: sesRel, live: fearGreed.live,
+    });
+  } else {
+    signals.push({ key: 'fg_24h', label: 'Sentiment Regime', category:'crypto', missing: true, weight: 0.08 });
+  }
+
+  // 12. BTC weekly change — broader context
+  const chg7d = btc7d?.chg7d ?? 0;
+  signals.push({
+    key: 'btc_7d', label: 'BTC 7d Change', category: 'crypto',
+    raw: chg7d, display: `${chg7d>=0?'+':''}${chg7d.toFixed(2)}%`,
+    score: norm(chg7d, 8.0), weight: 0.06,
+    freshness: 1.0, relevance: sesRel,
+  });
+
+  return signals;
+}
+
+// Compute final score from signal array using adaptive weights
+function computeAdaptiveScore(signals) {
+  let totalEW = 0;
+  const items = signals.map(s => {
+    if (s.missing) return { ...s, ew: 0, normWeight: 0, contribution: 0 };
+    const ew = s.weight * (s.freshness ?? 0.5) * (s.relevance ?? 0.5);
+    totalEW += ew;
+    return { ...s, ew };
+  });
+  if (totalEW === 0) return { score: 0, signals: items };
+  let score = 0;
+  for (const s of items) {
+    s.normWeight = s.ew / totalEW;
+    s.contribution = s.score * s.normWeight;
+    score += s.contribution;
+  }
+  return { score: Math.round(Math.max(-100, Math.min(100, score))), signals: items };
+}
+
+// ========================================================
+// DISPLAY HELPERS
+// ========================================================
+const scoreLabel = s => s>=60?'Strongly Bullish':s>=30?'Bullish':s>=10?'Leaning Bullish':s>=-10?'Neutral':s>=-30?'Leaning Bearish':s>=-60?'Bearish':'Strongly Bearish';
+const scoreColor = s => s>=40?'#22c55e':s>=15?'#4ade80':s>=-15?'#f59e0b':s>=-40?'#f87171':'#ef4444';
+
+function generateDivergenceExplain(score4h, score24h, sig4h, sig24h) {
+  const diff = score4h - score24h;
+  if (Math.abs(diff) < 12) return null;
+
+  if (diff > 0) {
+    // 4h more bullish than 24h
+    const top4h = sig4h.filter(s => !s.missing).sort((a,b) => b.contribution - a.contribution).slice(0,2);
+    return `4h is more bullish than 24h by ${Math.abs(diff)} points. Short-term momentum (${top4h.map(s=>s.label).join(', ')}) is outpacing the broader trend. This often occurs during breakout attempts or relief rallies within a weaker macro backdrop.`;
+  } else {
+    // 24h more bullish than 4h
+    const top24h = sig24h.filter(s => !s.missing).sort((a,b) => b.contribution - a.contribution).slice(0,2);
+    return `24h is more bullish than 4h by ${Math.abs(diff)} points. The broader regime (${top24h.map(s=>s.label).join(', ')}) is constructive, but short-term momentum is weak. This often signals an intraday dip within a bullish trend — potentially a buying opportunity if the macro thesis holds.`;
+  }
+}
+
+function genSummary(score, signals, tf, session) {
+  const label = score>=30?'bullish':score>=10?'slightly bullish':score>=-10?'neutral':score>=-30?'slightly bearish':'bearish';
+  const tfLabel = tf === '4h' ? 'next 4 hours' : 'next 24 hours';
+  const active = signals.filter(s => !s.missing);
+  const bull = active.filter(s => s.contribution > 1.5).sort((a,b) => b.contribution - a.contribution).slice(0,3);
+  const bear = active.filter(s => s.contribution < -1.5).sort((a,b) => a.contribution - b.contribution).slice(0,2);
+  let parts = [`<strong>${label[0].toUpperCase()+label.slice(1)}</strong> for the ${tfLabel}.`];
+  if (session.isWeekend) parts.push('Weekend — crypto-native signals dominate.');
+  if (bull.length) parts.push(`Drivers: ${bull.map(s=>`${s.label} (${s.display})`).join(', ')}.`);
+  if (bear.length) parts.push(`Headwinds: ${bear.map(s=>`${s.label} (${s.display})`).join(', ')}.`);
+  const stale = active.filter(s => s.category==='tradfi' && (s.freshness??1) < 0.3);
+  if (stale.length && tf==='4h') parts.push(`<span class="text-gray-600">${stale.length} stale TradFi signal(s) — weight shifted to crypto data.</span>`);
+  return parts.join(' ');
+}
+
+// ========================================================
+// COMPONENTS
+// ========================================================
+function GaugeChart({ score, size=220, id='g' }) {
+  const cx=size/2, r=size*.38, sw=size*.055;
+  const ang = Math.PI*(100-score)/200;
+  const nl=r-sw-6, nx=cx+nl*Math.cos(ang), ny=cx-nl*Math.sin(ang);
+  const col = scoreColor(score);
+  const arc = (s,e,rr) => { const x1=cx+rr*Math.cos(s),y1=cx-rr*Math.sin(s),x2=cx+rr*Math.cos(e),y2=cx-rr*Math.sin(e); return `M ${x1} ${y1} A ${rr} ${rr} 0 ${e-s>Math.PI?0:1} 0 ${x2} ${y2}`; };
+  return (
+    <div className="flex items-center justify-center" style={{width:size,height:size*.58}}>
+      <svg width={size} height={size*.58} viewBox={`0 0 ${size} ${size*.58}`}>
+        <defs>
+          <linearGradient id={`gg${id}`} x1="0%" y1="0%" x2="100%"><stop offset="0%" stopColor="#ef4444"/><stop offset="35%" stopColor="#f59e0b"/><stop offset="50%" stopColor="#eab308"/><stop offset="65%" stopColor="#84cc16"/><stop offset="100%" stopColor="#22c55e"/></linearGradient>
+          <filter id={`gl${id}`}><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+        <path d={arc(Math.PI,0,r)} fill="none" stroke="#1a2540" strokeWidth={sw} strokeLinecap="round"/>
+        <path d={arc(Math.PI,ang,r)} fill="none" stroke={`url(#gg${id})`} strokeWidth={sw} strokeLinecap="round" filter={`url(#gl${id})`}/>
+        {[-100,-50,0,50,100].map(t => { const a=Math.PI*(100-t)/200,o=r+sw/2+3,i=r+sw/2+(t%100===0?12:8); return <line key={t} x1={cx+o*Math.cos(a)} y1={cx-o*Math.sin(a)} x2={cx+i*Math.cos(a)} y2={cx-i*Math.sin(a)} stroke="#374151" strokeWidth={t%100===0?1.5:1}/>; })}
+        <text x={cx-r-16} y={cx+12} fill="#4b5563" fontSize="9" fontFamily="JetBrains Mono" textAnchor="middle">-100</text>
+        <text x={cx} y={cx-r-10} fill="#4b5563" fontSize="9" fontFamily="JetBrains Mono" textAnchor="middle">0</text>
+        <text x={cx+r+16} y={cx+12} fill="#4b5563" fontSize="9" fontFamily="JetBrains Mono" textAnchor="middle">+100</text>
+        <line x1={cx} y1={cx} x2={nx} y2={ny} stroke={col} strokeWidth={2} strokeLinecap="round" filter={`url(#gl${id})`}/>
+        <circle cx={cx} cy={cx} r={5} fill={col} filter={`url(#gl${id})`}/><circle cx={cx} cy={cx} r={2.5} fill="#080c14"/>
+      </svg>
+    </div>
+  );
+}
+
+function Sparkline({ data, color='#f97316', height=28 }) {
+  if (!data||data.length<2) return null;
+  const mn=Math.min(...data),mx=Math.max(...data),rng=mx-mn||1,w=100;
+  const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${height-((v-mn)/rng)*(height-2)-1}`).join(' ');
+  return <svg width="100%" height={height} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none"><polyline points={pts} fill="none" stroke={color} strokeWidth="1.2" strokeLinejoin="round"/></svg>;
+}
+
+function SessionBar({ si }) {
+  const {session,utcHour,isWeekend,marketsOpen}=si;
+  const pct=(utcHour/24)*100;
+  const segs=[{k:'asia',s:0,e:33.33,c:'#818cf8',l:'ASIA'},{k:'europe',s:33.33,e:56.25,c:'#38bdf8',l:'EU'},{k:'us',s:56.25,e:87.5,c:'#f59e0b',l:'US'},{k:'trans',s:87.5,e:100,c:'#6b7280',l:''}];
+  const oc=Object.values(marketsOpen).filter(Boolean).length,tc=Object.keys(marketsOpen).length;
+  return (
+    <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 animate-fade-in">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono text-gray-500 uppercase">Session:</span>
+          <span className="text-xs font-mono font-semibold" style={{color:SESSIONS[session]?.color||'#6b7280'}}>{isWeekend?'WEEKEND':SESSIONS[session]?.label?.toUpperCase()||'TRANSITION'}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono text-gray-500">{oc}/{tc} mkts open</span>
+          <span className="text-[10px] font-mono text-gray-600">{String(Math.floor(utcHour)).padStart(2,'0')}:{String(Math.round((utcHour%1)*60)).padStart(2,'0')} UTC</span>
+        </div>
+      </div>
+      <div className="relative h-3 bg-gray-900 rounded-full overflow-hidden">
+        {segs.map(s=><div key={s.k} className="absolute top-0 h-full" style={{left:`${s.s}%`,width:`${s.e-s.s}%`,backgroundColor:s.c,opacity:session===s.k?.6:.15}}/>)}
+        <div className="absolute top-0 h-full w-0.5 bg-white live-dot" style={{left:`${pct}%`}}/>
+      </div>
+      <div className="flex justify-between mt-1.5 text-[9px] font-mono text-gray-600">
+        <span>00 UTC</span>{segs.filter(s=>s.l).map(s=><span key={s.k} style={{color:session===s.k?s.c:'#4b5563'}}>{s.l}</span>)}<span>24 UTC</span>
+      </div>
+    </div>
+  );
+}
+
+function DualScore({ s4, s24, sum4, sum24, divExplain, loading }) {
+  return (
+    <div className="animate-fade-in">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="flex flex-col items-center">
+          <div className="text-[10px] font-mono uppercase tracking-widest mb-1">
+            <span className="text-blue-400">Tactical Momentum</span> <span className="text-gray-600">/ 4 Hours</span>
+          </div>
+          <GaugeChart score={loading?0:s4} size={240} id="4h"/>
+          <div className="text-center -mt-1">
+            <div className="font-mono text-4xl font-bold" style={{color:scoreColor(s4)}}>{loading?'—':`${s4>0?'+':''}${s4}`}</div>
+            <div className="text-sm font-semibold mt-0.5" style={{color:scoreColor(s4)}}>{loading?'Loading...':scoreLabel(s4)}</div>
+          </div>
+          {!loading&&sum4&&<div className="mt-3 text-xs text-gray-400 leading-relaxed text-center px-2 max-w-sm" dangerouslySetInnerHTML={{__html:sum4}}/>}
+        </div>
+        <div className="flex flex-col items-center">
+          <div className="text-[10px] font-mono uppercase tracking-widest mb-1">
+            <span className="text-purple-400">Macro Regime</span> <span className="text-gray-600">/ 24 Hours</span>
+          </div>
+          <GaugeChart score={loading?0:s24} size={240} id="24h"/>
+          <div className="text-center -mt-1">
+            <div className="font-mono text-4xl font-bold" style={{color:scoreColor(s24)}}>{loading?'—':`${s24>0?'+':''}${s24}`}</div>
+            <div className="text-sm font-semibold mt-0.5" style={{color:scoreColor(s24)}}>{loading?'Loading...':scoreLabel(s24)}</div>
+          </div>
+          {!loading&&sum24&&<div className="mt-3 text-xs text-gray-400 leading-relaxed text-center px-2 max-w-sm" dangerouslySetInnerHTML={{__html:sum24}}/>}
+        </div>
+      </div>
+      {!loading && divExplain && (
+        <div className="mt-4 px-4 py-3 bg-terminal-highlight/20 border border-terminal-border rounded-lg text-xs text-gray-400 leading-relaxed">
+          <span className="font-mono text-gray-500 uppercase text-[10px]">Score Divergence:</span> {divExplain}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BTCCard({ btc7d, btcBasic }) {
+  const btc = btc7d || btcBasic;
+  if (!btc) return null;
+  const c4 = btc7d?.chg4h, c24 = btc7d?.chg24h ?? btcBasic?.change24h, c7 = btc7d?.chg7d;
+  const cc = v => (v??0)>=0?'text-bull-light':'text-bear-light';
+  return (
+    <div className="bg-terminal-card border-2 border-orange-900/50 rounded-lg p-4 card-hover animate-fade-in">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs text-orange-400 font-mono uppercase tracking-wider font-bold">Bitcoin</span>
+        <div className={`w-1.5 h-1.5 rounded-full ${btc.live?'bg-green-500 live-dot':'bg-yellow-600'}`}/>
+      </div>
+      <div className="font-mono text-2xl font-bold text-orange-400">${btc.price?.toLocaleString('en-US',{maximumFractionDigits:0})}</div>
+      <div className="flex items-center gap-3 mt-1 flex-wrap">
+        {c4!=null&&<span className={`font-mono text-xs ${cc(c4)}`}>{c4>=0?'+':''}{c4.toFixed(2)}% <span className="text-gray-600">4h</span></span>}
+        {c24!=null&&<span className={`font-mono text-xs ${cc(c24)}`}>{c24>=0?'+':''}{c24.toFixed(2)}% <span className="text-gray-600">24h</span></span>}
+        {c7!=null&&<span className={`font-mono text-xs ${cc(c7)}`}>{c7>=0?'+':''}{c7.toFixed(1)}% <span className="text-gray-600">7d</span></span>}
+      </div>
+      {btcBasic&&<div className="text-[10px] text-gray-600 mt-1 font-mono">Vol: ${(btcBasic.volume/1e9)?.toFixed(1)}B &middot; MCap: ${(btcBasic.marketCap/1e12)?.toFixed(2)}T</div>}
+      {btc7d?.rangePos!=null&&<div className="text-[10px] text-gray-600 mt-0.5 font-mono">7d range: {btc7d.rangePos.toFixed(0)}% &middot; {btc7d.acceleration>=0?'Accelerating':'Decelerating'}</div>}
+      {btc7d?.sparkline?.length>3&&<div className="mt-2"><Sparkline data={btc7d.sparkline}/></div>}
+    </div>
+  );
+}
+
+function SignalRow({ s }) {
+  if (s.missing) return (
+    <tr className="border-b border-terminal-border/30 opacity-30">
+      <td className="p-2 font-mono text-gray-500 text-xs">{s.label}</td>
+      <td colSpan={4} className="p-2 text-center text-gray-700 text-xs">No data</td>
+    </tr>
+  );
+  const cc = v => v>1.5?'text-bull-light':v<-1.5?'text-bear-light':'text-gray-500';
+  const sc = v => v>10?'text-bull-light':v<-10?'text-bear-light':'text-warn';
+  return (
+    <tr className="border-b border-terminal-border/30 hover:bg-terminal-highlight/10">
+      <td className="p-2 font-mono text-gray-300 text-xs">
+        <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1.5 ${s.category==='crypto'?'bg-orange-500':'bg-blue-500'}`}/>
+        {s.label}
+        {s.ageH!=null&&s.ageH>.5&&<span className="text-gray-700 ml-1 text-[9px]">{fmtAge(s.ageH)}</span>}
+      </td>
+      <td className="p-2 text-right font-mono text-gray-400 text-xs">{s.display||'—'}</td>
+      <td className={`p-2 text-right font-mono text-xs ${sc(s.score)}`}>{s.score>0?'+':''}{Math.round(s.score)}</td>
+      <td className="p-2 text-right font-mono text-gray-600 text-xs">{((s.normWeight||0)*100).toFixed(0)}%</td>
+      <td className={`p-2 text-right font-mono font-semibold text-xs ${cc(s.contribution||0)}`}>{(s.contribution||0)>0?'+':''}{(s.contribution||0).toFixed(1)}</td>
+    </tr>
+  );
+}
+
+function SignalPanel({ title, subtitle, color, signals, score }) {
+  const sorted = [...signals].sort((a,b) => Math.abs(b.contribution||0)-Math.abs(a.contribution||0));
+  return (
+    <div className="animate-fade-in">
+      <div className="flex items-baseline gap-2 mb-2">
+        <h3 className="text-xs font-mono uppercase tracking-wider" style={{color}}>{title}</h3>
+        <span className="text-[10px] font-mono text-gray-600">{subtitle}</span>
+      </div>
+      <div className="bg-terminal-card border border-terminal-border rounded-lg overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className="border-b border-terminal-border">
+            <th className="text-left p-2 font-mono text-gray-500 uppercase">Signal</th>
+            <th className="text-right p-2 font-mono text-gray-500 uppercase">Value</th>
+            <th className="text-right p-2 font-mono text-gray-500 uppercase">Score</th>
+            <th className="text-right p-2 font-mono text-gray-500 uppercase">Weight</th>
+            <th className="text-right p-2 font-mono text-gray-500 uppercase">Contrib</th>
+          </tr></thead>
+          <tbody>{sorted.map(s => <SignalRow key={s.key} s={s}/>)}</tbody>
+          <tfoot><tr className="bg-terminal-highlight/20">
+            <td colSpan={4} className="p-2 font-mono font-semibold text-gray-300">Score</td>
+            <td className="p-2 text-right font-mono font-bold text-sm" style={{color:scoreColor(score)}}>{score>0?'+':''}{score}</td>
+          </tr></tfoot>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function MethodNote() {
+  return (
+    <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 text-[11px] text-gray-500 leading-relaxed animate-fade-in">
+      <h4 className="font-mono uppercase tracking-wider text-gray-400 mb-2 text-xs">Methodology v3 — Dual Model</h4>
+      <p className="mb-2">
+        v3 uses <strong className="text-blue-400">two fundamentally different scoring models</strong>, not just different weights on the same signals:
+      </p>
+      <p className="mb-2">
+        <strong className="text-blue-400">4h Tactical Momentum</strong> asks "what is the short-term flow direction?" It uses BTC's 4-hour price change as its dominant signal (22% weight), plus a unique <strong className="text-gray-400">acceleration</strong> signal (is the move speeding up or fading?), VIX <em>change direction</em> (is fear rising or falling right now?), Fear & Greed <em>shift</em> (is sentiment changing?), and a mean-reversion-aware range position.
+      </p>
+      <p className="mb-2">
+        <strong className="text-purple-400">24h Macro Regime</strong> asks "what is the broader environment?" It uses BTC's <strong className="text-gray-400">multi-day trend direction</strong> as a key signal (12% weight), blends daily changes with 3-5 day trends for each TradFi asset (60% trend / 40% daily), uses VIX <em>absolute level</em> bands instead of direction, Fear & Greed <em>absolute level</em>, and a trend-confirming range position.
+      </p>
+      <p>
+        The same raw data produces different derived signals for each model. Session relevance and freshness decay still apply as adaptive weight multipliers. When scores diverge significantly, the dashboard explains why — e.g., "short-term pullback within bullish regime."
+      </p>
+    </div>
+  );
+}
+
+// ========================================================
+// MAIN APP
+// ========================================================
+function App() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [liveCount, setLiveCount] = useState(0);
+  const [isDemo, setIsDemo] = useState(false);
+  const [error, setError] = useState(null);
+  const [si, setSi] = useState(getCurrentSessionInfo());
+  const ref1 = useRef(null), ref2 = useRef(null);
+
+  useEffect(() => { ref2.current = setInterval(()=>setSi(getCurrentSessionInfo()), 30000); return ()=>clearInterval(ref2.current); }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const d = await fetchAll();
+      let live = 0;
+      if(d.btc7d?.live) live++; if(d.btcBasic?.live) live++; if(d.ethBtc?.live) live++; if(d.fearGreed?.live) live++;
+      Object.values(d.tradfi).forEach(m => { if(m?.live) live++; });
+      const demo = demoData();
+      if (live <= 1) {
+        setData({ btc7d:d.btc7d||demo.btc7d, btcBasic:d.btcBasic||demo.btcBasic, ethBtc:d.ethBtc||demo.ethBtc, fearGreed:d.fearGreed||demo.fearGreed, tradfi:{...demo.tradfi,...d.tradfi} });
+        setIsDemo(live===0);
       } else {
-        const sessionLabel = SESSIONS[sessionInfo.session]?.label || 'Transition';
-        parts.push(`Currently in the <strong>${sessionLabel}</strong>.`);
-      }
-
-      if (bullish.length > 0) {
-        const drivers = bullish.map(([key, _]) => {
-          const s = signals[key];
-          if (key.startsWith('btcMom')) return `BTC momentum +${Math.abs(s.raw)?.toFixed(1)}%`;
-          if (key === 'fearGreed') return `sentiment in ${s.fgLabel} zone`;
-          if (key === 'ethBtc') return `ETH/BTC ratio ${s.raw >= 0 ? 'rising' : 'falling'}`;
-          if (s.isLevel) return `${s.label} at ${s.price?.toFixed(1)}`;
-          const dir = s.inverse ? (s.change < 0 ? 'weakening' : 'strengthening') : (s.change > 0 ? 'up' : 'down');
-          return `${s.label} ${dir} ${Math.abs(s.change)?.toFixed(2)}%`;
+        setData({
+          btc7d:d.btc7d||demo.btc7d, btcBasic:d.btcBasic||demo.btcBasic, ethBtc:d.ethBtc||demo.ethBtc, fearGreed:d.fearGreed||demo.fearGreed,
+          tradfi: Object.fromEntries(Object.keys(YAHOO_SYMS).map(k => [k, d.tradfi[k]||demo.tradfi[k]])),
         });
-        parts.push(`Bullish: ${drivers.join(', ')}.`);
+        setIsDemo(false);
       }
-      if (bearish.length > 0) {
-        const risks = bearish.map(([key, _]) => {
-          const s = signals[key];
-          if (key.startsWith('btcMom')) return `BTC momentum weak`;
-          if (key === 'fearGreed') return `sentiment at ${s.raw} (${s.fgLabel})`;
-          if (key === 'ethBtc') return `ETH/BTC ratio declining`;
-          if (s.isLevel) return `${s.label} elevated at ${s.price?.toFixed(1)}`;
-          const dir = s.inverse ? (s.change > 0 ? 'rising' : 'falling') : (s.change < 0 ? 'declining' : 'rising');
-          return `${s.label} ${dir}`;
-        });
-        parts.push(`Risks: ${risks.join(', ')}.`);
-      }
-
-      // Count stale signals for 4h
-      if (timeframe === '4h') {
-        const stale = Object.entries(signals).filter(([_, s]) => !s.missing && s.category === 'tradfi' && s.freshness4h < 0.3);
-        if (stale.length > 0) {
-          parts.push(`<span class="text-gray-600">${stale.length} TradFi signal(s) stale — weight shifted to crypto-native data.</span>`);
-        }
-      }
-
-      return parts.join(' ');
+      setLiveCount(live); setLastUpdate(new Date());
+    } catch(e) {
+      console.error(e); setData(demoData()); setIsDemo(true); setLastUpdate(new Date());
+      setError('Using demo data — live APIs unreachable');
     }
+    setLoading(false);
+  }, []);
 
-    // =============================================
-    // COMPONENTS
-    // =============================================
+  useEffect(() => { load(); ref1.current = setInterval(load, 5*60000); return ()=>clearInterval(ref1.current); }, [load]);
 
-    function GaugeChart({ score, size = 220, id = 'g' }) {
-      const center = size / 2;
-      const radius = size * 0.38;
-      const sw = size * 0.055;
-      const scoreAngle = Math.PI * (100 - score) / 200;
-      const nLen = radius - sw - 6;
-      const nX = center + nLen * Math.cos(scoreAngle);
-      const nY = center - nLen * Math.sin(scoreAngle);
-      const color = getScoreColor(score);
+  const sig4h = useMemo(() => data ? derive4hSignals(data, si) : [], [data, si]);
+  const sig24h = useMemo(() => data ? derive24hSignals(data, si) : [], [data, si]);
+  const res4h = useMemo(() => computeAdaptiveScore(sig4h), [sig4h]);
+  const res24h = useMemo(() => computeAdaptiveScore(sig24h), [sig24h]);
+  const sum4h = useMemo(() => sig4h.length ? genSummary(res4h.score, res4h.signals, '4h', si) : '', [res4h, si]);
+  const sum24h = useMemo(() => sig24h.length ? genSummary(res24h.score, res24h.signals, '24h', si) : '', [res24h, si]);
+  const divExplain = useMemo(() => generateDivergenceExplain(res4h.score, res24h.score, res4h.signals, res24h.signals), [res4h, res24h]);
 
-      const arcPath = (s, e, r) => {
-        const x1 = center + r * Math.cos(s), y1 = center - r * Math.sin(s);
-        const x2 = center + r * Math.cos(e), y2 = center - r * Math.sin(e);
-        return `M ${x1} ${y1} A ${r} ${r} 0 ${e - s > Math.PI ? 0 : 1} 0 ${x2} ${y2}`;
-      };
-
-      return (
-        <div className="flex items-center justify-center" style={{ width: size, height: size * 0.58 }}>
-          <svg width={size} height={size * 0.58} viewBox={`0 0 ${size} ${size * 0.58}`}>
-            <defs>
-              <linearGradient id={`gg-${id}`} x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stopColor="#ef4444" /><stop offset="35%" stopColor="#f59e0b" />
-                <stop offset="50%" stopColor="#eab308" /><stop offset="65%" stopColor="#84cc16" /><stop offset="100%" stopColor="#22c55e" />
-              </linearGradient>
-              <filter id={`gl-${id}`}><feGaussianBlur stdDeviation="2.5" result="b" /><feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
-            </defs>
-            <path d={arcPath(Math.PI, 0, radius)} fill="none" stroke="#1a2540" strokeWidth={sw} strokeLinecap="round" />
-            <path d={arcPath(Math.PI, scoreAngle, radius)} fill="none" stroke={`url(#gg-${id})`} strokeWidth={sw} strokeLinecap="round" filter={`url(#gl-${id})`} />
-            {[-100, -50, 0, 50, 100].map((tick) => {
-              const a = Math.PI * (100 - tick) / 200;
-              const o = radius + sw / 2 + 3, i = radius + sw / 2 + (tick % 100 === 0 ? 12 : 8);
-              return <line key={tick} x1={center + o * Math.cos(a)} y1={center - o * Math.sin(a)} x2={center + i * Math.cos(a)} y2={center - i * Math.sin(a)} stroke="#374151" strokeWidth={tick % 100 === 0 ? 1.5 : 1} />;
-            })}
-            <text x={center - radius - 16} y={center + 12} fill="#4b5563" fontSize="9" fontFamily="JetBrains Mono" textAnchor="middle">-100</text>
-            <text x={center} y={center - radius - 10} fill="#4b5563" fontSize="9" fontFamily="JetBrains Mono" textAnchor="middle">0</text>
-            <text x={center + radius + 16} y={center + 12} fill="#4b5563" fontSize="9" fontFamily="JetBrains Mono" textAnchor="middle">+100</text>
-            <line x1={center} y1={center} x2={nX} y2={nY} stroke={color} strokeWidth={2} strokeLinecap="round" filter={`url(#gl-${id})`} />
-            <circle cx={center} cy={center} r={5} fill={color} filter={`url(#gl-${id})`} />
-            <circle cx={center} cy={center} r={2.5} fill="#080c14" />
-          </svg>
+  return (
+    <div className="max-w-6xl mx-auto px-4 py-5">
+      <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-2">
+        <div>
+          <h1 className="text-xl font-bold text-white tracking-tight"><span className="text-orange-400">BTC</span> Macro Pulse <span className="text-xs font-mono text-gray-600 ml-1">v3</span></h1>
+          <p className="text-[10px] text-gray-500 mt-0.5 font-mono">Dual-Model Session-Aware Sentiment Engine</p>
         </div>
-      );
-    }
-
-    function DualScoreHero({ score4h, score24h, summary4h, summary24h, loading }) {
-      return (
-        <div className="animate-fade-in">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {/* 4-Hour Score */}
-            <div className="flex flex-col items-center">
-              <div className="text-xs font-mono text-gray-500 uppercase tracking-widest mb-2">4-Hour Outlook</div>
-              <GaugeChart score={loading ? 0 : score4h} size={240} id="4h" />
-              <div className="text-center -mt-1">
-                <div className="font-mono text-4xl font-bold" style={{ color: getScoreColor(score4h) }}>
-                  {loading ? '—' : `${score4h > 0 ? '+' : ''}${score4h}`}
-                </div>
-                <div className="text-sm font-semibold mt-0.5" style={{ color: getScoreColor(score4h) }}>
-                  {loading ? 'Loading...' : getScoreLabel(score4h)}
-                </div>
-              </div>
-              {!loading && summary4h && (
-                <div className="mt-3 text-xs text-gray-400 leading-relaxed text-center px-2 max-w-sm" dangerouslySetInnerHTML={{ __html: summary4h }} />
-              )}
-            </div>
-
-            {/* 24-Hour Score */}
-            <div className="flex flex-col items-center">
-              <div className="text-xs font-mono text-gray-500 uppercase tracking-widest mb-2">24-Hour Outlook</div>
-              <GaugeChart score={loading ? 0 : score24h} size={240} id="24h" />
-              <div className="text-center -mt-1">
-                <div className="font-mono text-4xl font-bold" style={{ color: getScoreColor(score24h) }}>
-                  {loading ? '—' : `${score24h > 0 ? '+' : ''}${score24h}`}
-                </div>
-                <div className="text-sm font-semibold mt-0.5" style={{ color: getScoreColor(score24h) }}>
-                  {loading ? 'Loading...' : getScoreLabel(score24h)}
-                </div>
-              </div>
-              {!loading && summary24h && (
-                <div className="mt-3 text-xs text-gray-400 leading-relaxed text-center px-2 max-w-sm" dangerouslySetInnerHTML={{ __html: summary24h }} />
-              )}
-            </div>
-          </div>
+        <div className="flex items-center gap-3 text-xs font-mono">
+          {isDemo&&<span className="px-2 py-0.5 bg-yellow-900/40 text-yellow-500 rounded border border-yellow-800/50 text-[10px]">DEMO</span>}
+          {!isDemo&&liveCount>0&&<span className="flex items-center gap-1 px-2 py-0.5 bg-green-900/30 text-green-400 rounded border border-green-800/50 text-[10px]"><span className="w-1.5 h-1.5 bg-green-500 rounded-full live-dot"/>{liveCount} LIVE</span>}
+          {lastUpdate&&<span className="text-gray-600 text-[10px]">{lastUpdate.toLocaleTimeString()}</span>}
+          <button onClick={load} disabled={loading} className="px-2.5 py-1 bg-terminal-card border border-terminal-border rounded text-gray-400 hover:text-white hover:border-gray-600 transition disabled:opacity-50 text-[10px]">{loading?'...':'Refresh'}</button>
         </div>
-      );
-    }
+      </header>
 
-    function SessionBar({ sessionInfo }) {
-      const { session, utcHour, isWeekend, marketsOpen } = sessionInfo;
-      const pct = (utcHour / 24) * 100;
+      {error&&<div className="mb-3 px-3 py-1.5 bg-yellow-900/20 border border-yellow-800/40 rounded text-yellow-500 text-[10px] font-mono">{error}</div>}
 
-      const segments = [
-        { key: 'asia', start: 0, end: 33.33, color: '#818cf8', label: 'ASIA' },
-        { key: 'europe', start: 33.33, end: 56.25, color: '#38bdf8', label: 'EU' },
-        { key: 'us', start: 56.25, end: 87.5, color: '#f59e0b', label: 'US' },
-        { key: 'trans', start: 87.5, end: 100, color: '#6b7280', label: '' },
-      ];
+      <section className="mb-4"><SessionBar si={si}/></section>
 
-      const openCount = Object.values(marketsOpen).filter(Boolean).length;
-      const totalMarkets = Object.keys(marketsOpen).length;
+      <section className="bg-terminal-card border border-terminal-border rounded-xl p-5 mb-4">
+        <DualScore s4={res4h.score} s24={res24h.score} sum4={sum4h} sum24={sum24h} divExplain={divExplain} loading={loading}/>
+      </section>
 
-      return (
-        <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 animate-fade-in">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-mono text-gray-500 uppercase">Session:</span>
-              <span className="text-xs font-mono font-semibold" style={{ color: SESSIONS[session]?.color || '#6b7280' }}>
-                {isWeekend ? 'WEEKEND' : SESSIONS[session]?.label?.toUpperCase() || 'TRANSITION'}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-mono text-gray-500">{openCount}/{totalMarkets} markets open</span>
-              <span className="text-[10px] font-mono text-gray-600">{String(Math.floor(utcHour)).padStart(2,'0')}:{String(Math.round((utcHour % 1) * 60)).padStart(2,'0')} UTC</span>
-            </div>
-          </div>
-          <div className="relative h-3 bg-gray-900 rounded-full overflow-hidden">
-            {segments.map(seg => (
-              <div
-                key={seg.key}
-                className="absolute top-0 h-full"
-                style={{
-                  left: `${seg.start}%`, width: `${seg.end - seg.start}%`,
-                  backgroundColor: seg.color, opacity: session === seg.key ? 0.6 : 0.15,
-                }}
-              />
-            ))}
-            {/* Now marker */}
-            <div className="absolute top-0 h-full w-0.5 bg-white live-dot" style={{ left: `${pct}%` }} />
-          </div>
-          <div className="flex justify-between mt-1.5 text-[9px] font-mono text-gray-600">
-            <span>00 UTC</span>
-            {segments.filter(s => s.label).map(seg => (
-              <span key={seg.key} style={{ color: session === seg.key ? seg.color : '#4b5563' }}>{seg.label}</span>
-            ))}
-            <span>24 UTC</span>
-          </div>
-        </div>
-      );
-    }
+      <section className="mb-4"><BTCCard btc7d={data?.btc7d} btcBasic={data?.btcBasic}/></section>
 
-    function MarketCard({ signalKey, signal, contribution4h, contribution24h }) {
-      if (signal.missing) {
-        return (
-          <div className="bg-terminal-card border border-terminal-border rounded-lg p-3 opacity-40">
-            <div className="text-xs text-gray-500 font-mono uppercase tracking-wider">{signal.label}</div>
-            <div className="text-gray-600 text-xs mt-2">No data</div>
-          </div>
-        );
-      }
+      <section className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+        <SignalPanel title="4h Tactical Momentum" subtitle="Short-term flow" color="#60a5fa" signals={res4h.signals} score={res4h.score}/>
+        <SignalPanel title="24h Macro Regime" subtitle="Broader environment" color="#a78bfa" signals={res24h.signals} score={res24h.score}/>
+      </section>
 
-      const isStale = signal.category === 'tradfi' && signal.freshness4h < 0.3;
-      const changeColor = (signal.change ?? signal.raw ?? 0) > 0 ? 'text-bull-light' : (signal.change ?? signal.raw ?? 0) < 0 ? 'text-bear-light' : 'text-gray-400';
-      const sigColor = signal.signal > 10 ? 'text-bull-light' : signal.signal < -10 ? 'text-bear-light' : 'text-warn';
-      const sigBg = signal.signal > 10 ? 'bg-green-900/30' : signal.signal < -10 ? 'bg-red-900/30' : 'bg-yellow-900/20';
+      <section className="mb-4"><MethodNote/></section>
 
-      const fmtPrice = (p) => {
-        if (!p && p !== 0) return '—';
-        if (p > 10000) return p.toLocaleString('en-US', { maximumFractionDigits: 0 });
-        if (p > 100) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
-        if (p > 1) return p.toFixed(2);
-        return p.toFixed(4);
-      };
+      <footer className="text-center text-[10px] text-gray-700 font-mono py-3 border-t border-terminal-border">
+        BTC Macro Pulse v3.0 &middot; Dual-model &middot; Session-aware &middot; Refreshes every 5 min &middot; Not financial advice
+      </footer>
+    </div>
+  );
+}
 
-      return (
-        <div className={`bg-terminal-card border border-terminal-border rounded-lg p-3 card-hover animate-fade-in ${isStale ? 'stale-overlay' : ''}`}>
-          <div className="flex items-center justify-between mb-1.5">
-            <div className="text-[10px] text-gray-500 font-mono uppercase tracking-wider leading-tight">{signal.label}</div>
-            <div className="flex items-center gap-1.5">
-              {signal.dataAgeHours != null && signal.dataAgeHours > 0.5 && (
-                <span className="text-[9px] font-mono text-gray-600">{formatDataAge(signal.dataAgeHours)}</span>
-              )}
-              <div className={`w-1.5 h-1.5 rounded-full ${signal.live ? (isStale ? 'bg-yellow-600' : 'bg-green-500 live-dot') : 'bg-gray-600'}`} />
-            </div>
-          </div>
-          {signal.price != null && (
-            <div className="font-mono text-lg font-semibold text-white">{fmtPrice(signal.price)}</div>
-          )}
-          <div className="flex items-center justify-between mt-1">
-            <span className={`font-mono text-xs ${changeColor}`}>
-              {signal.isLevel && signalKey !== 'fearGreed' ? 'Level' :
-               signalKey === 'fearGreed' ? signal.fgLabel :
-               `${(signal.change ?? signal.raw) >= 0 ? '+' : ''}${(signal.change ?? signal.raw)?.toFixed(2)}%`}
-            </span>
-            <span className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${sigBg} ${sigColor}`}>
-              {signal.signal > 0 ? '+' : ''}{Math.round(signal.signal)}
-            </span>
-          </div>
-          {/* Freshness bar */}
-          <div className="flex items-center gap-1 mt-1.5">
-            <div className="flex-1 bg-gray-800 rounded-full h-0.5">
-              <div className="h-0.5 rounded-full bg-blue-500/50 transition-all" style={{ width: `${signal.freshness4h * 100}%` }} />
-            </div>
-            <span className="text-[8px] font-mono text-gray-700">4h</span>
-          </div>
-          <div className="flex items-center gap-1 mt-0.5">
-            <div className="flex-1 bg-gray-800 rounded-full h-0.5">
-              <div className="h-0.5 rounded-full bg-purple-500/50 transition-all" style={{ width: `${signal.freshness24h * 100}%` }} />
-            </div>
-            <span className="text-[8px] font-mono text-gray-700">24h</span>
-          </div>
-          <div className="text-[9px] text-gray-700 mt-1 font-mono">
-            Wt: {((contribution4h?.weight ?? 0) * 100).toFixed(0)}% (4h) / {((contribution24h?.weight ?? 0) * 100).toFixed(0)}% (24h)
-            {signal.inverse ? ' inv' : ''}
-          </div>
-        </div>
-      );
-    }
-
-    function BTCCard({ btcHourly, btcBasic }) {
-      const btc = btcHourly || btcBasic;
-      if (!btc) return null;
-      const c4h = btcHourly?.change4h;
-      const c24h = btc.change24h ?? btcBasic?.change24h;
-      const c4Color = (c4h ?? 0) >= 0 ? 'text-bull-light' : 'text-bear-light';
-      const c24Color = (c24h ?? 0) >= 0 ? 'text-bull-light' : 'text-bear-light';
-
-      return (
-        <div className="bg-terminal-card border-2 border-orange-900/50 rounded-lg p-4 card-hover animate-fade-in">
-          <div className="flex items-center justify-between mb-1">
-            <span className="text-xs text-orange-400 font-mono uppercase tracking-wider font-bold">Bitcoin</span>
-            <div className={`w-1.5 h-1.5 rounded-full ${btc.live ? 'bg-green-500 live-dot' : 'bg-yellow-600'}`} />
-          </div>
-          <div className="font-mono text-2xl font-bold text-orange-400">
-            ${btc.price?.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-          </div>
-          <div className="flex items-center gap-3 mt-1">
-            {c4h != null && <span className={`font-mono text-xs ${c4Color}`}>{c4h >= 0 ? '+' : ''}{c4h.toFixed(2)}% <span className="text-gray-600">4h</span></span>}
-            {c24h != null && <span className={`font-mono text-xs ${c24Color}`}>{c24h >= 0 ? '+' : ''}{c24h.toFixed(2)}% <span className="text-gray-600">24h</span></span>}
-          </div>
-          {btcBasic && (
-            <div className="text-[10px] text-gray-600 mt-1 font-mono">
-              Vol: ${(btcBasic.volume / 1e9)?.toFixed(1)}B &middot; MCap: ${(btcBasic.marketCap / 1e12)?.toFixed(2)}T
-            </div>
-          )}
-          {/* Mini sparkline */}
-          {btcHourly?.sparkline && btcHourly.sparkline.length > 3 && (
-            <div className="mt-2">
-              <Sparkline data={btcHourly.sparkline} color="#f97316" height={28} />
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    function Sparkline({ data, color = '#4ade80', height = 24 }) {
-      if (!data || data.length < 2) return null;
-      const min = Math.min(...data);
-      const max = Math.max(...data);
-      const range = max - min || 1;
-      const w = 100;
-      const points = data.map((v, i) => `${(i / (data.length - 1)) * w},${height - ((v - min) / range) * (height - 2) - 1}`).join(' ');
-      return (
-        <svg width="100%" height={height} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none">
-          <polyline points={points} fill="none" stroke={color} strokeWidth="1.2" strokeLinejoin="round" />
-        </svg>
-      );
-    }
-
-    function SignalTable({ signals, result4h, result24h }) {
-      const sorted = Object.entries(signals)
-        .filter(([_, s]) => !s.missing)
-        .sort((a, b) => Math.abs(result4h.contributions[b[0]]?.contribution || 0) - Math.abs(result4h.contributions[a[0]]?.contribution || 0));
-
-      return (
-        <div className="animate-fade-in">
-          <h3 className="text-xs font-mono text-gray-500 uppercase tracking-wider mb-2">Signal Breakdown</h3>
-          <div className="bg-terminal-card border border-terminal-border rounded-lg overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-terminal-border">
-                  <th className="text-left p-2.5 font-mono text-gray-500 uppercase">Signal</th>
-                  <th className="text-right p-2.5 font-mono text-gray-500 uppercase">Raw</th>
-                  <th className="text-right p-2.5 font-mono text-gray-500 uppercase">Score</th>
-                  <th className="text-center p-2.5 font-mono text-gray-500 uppercase">Fresh</th>
-                  <th className="text-right p-2.5 font-mono text-gray-500 uppercase">4h Wt</th>
-                  <th className="text-right p-2.5 font-mono text-gray-500 uppercase">4h Contrib</th>
-                  <th className="text-right p-2.5 font-mono text-gray-500 uppercase">24h Wt</th>
-                  <th className="text-right p-2.5 font-mono text-gray-500 uppercase">24h Contrib</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sorted.map(([key, s]) => {
-                  const c4 = result4h.contributions[key] || {};
-                  const c24 = result24h.contributions[key] || {};
-                  const cc4 = (c4.contribution || 0) > 1 ? 'text-bull-light' : (c4.contribution || 0) < -1 ? 'text-bear-light' : 'text-gray-500';
-                  const cc24 = (c24.contribution || 0) > 1 ? 'text-bull-light' : (c24.contribution || 0) < -1 ? 'text-bear-light' : 'text-gray-500';
-                  const freshColor = s.freshness4h >= 0.7 ? 'text-green-500' : s.freshness4h >= 0.3 ? 'text-yellow-500' : 'text-red-500';
-                  return (
-                    <tr key={key} className="border-b border-terminal-border/30 hover:bg-terminal-highlight/10">
-                      <td className="p-2.5 font-mono text-gray-300">
-                        <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1.5 ${s.category === 'crypto' ? 'bg-orange-500' : 'bg-blue-500'}`} />
-                        {s.label}
-                        {s.inverse && <span className="text-gray-700 ml-1">(inv)</span>}
-                      </td>
-                      <td className="p-2.5 text-right font-mono text-gray-400">
-                        {s.isLevel ? (s.raw?.toFixed?.(1) ?? s.raw) : `${(s.raw ?? 0) >= 0 ? '+' : ''}${(s.raw ?? 0).toFixed?.(2) ?? s.raw}%`}
-                      </td>
-                      <td className="p-2.5 text-right font-mono">
-                        <span className={s.signal > 0 ? 'text-bull-light' : s.signal < 0 ? 'text-bear-light' : 'text-gray-400'}>
-                          {s.signal > 0 ? '+' : ''}{Math.round(s.signal)}
-                        </span>
-                      </td>
-                      <td className={`p-2.5 text-center font-mono ${freshColor}`}>
-                        {(s.freshness4h * 100).toFixed(0)}%
-                      </td>
-                      <td className="p-2.5 text-right font-mono text-gray-500">{((c4.weight || 0) * 100).toFixed(1)}%</td>
-                      <td className={`p-2.5 text-right font-mono font-semibold ${cc4}`}>
-                        {(c4.contribution || 0) > 0 ? '+' : ''}{(c4.contribution || 0).toFixed(1)}
-                      </td>
-                      <td className="p-2.5 text-right font-mono text-gray-500">{((c24.weight || 0) * 100).toFixed(1)}%</td>
-                      <td className={`p-2.5 text-right font-mono font-semibold ${cc24}`}>
-                        {(c24.contribution || 0) > 0 ? '+' : ''}{(c24.contribution || 0).toFixed(1)}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-              <tfoot>
-                <tr className="bg-terminal-highlight/20">
-                  <td colSpan={5} className="p-2.5 font-mono font-semibold text-gray-300">Macro Score</td>
-                  <td className="p-2.5 text-right font-mono font-bold text-sm" style={{ color: getScoreColor(result4h.score) }}>
-                    {result4h.score > 0 ? '+' : ''}{result4h.score}
-                  </td>
-                  <td className="p-2.5" />
-                  <td className="p-2.5 text-right font-mono font-bold text-sm" style={{ color: getScoreColor(result24h.score) }}>
-                    {result24h.score > 0 ? '+' : ''}{result24h.score}
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
-        </div>
-      );
-    }
-
-    function MethodologyNote({ sessionInfo }) {
-      return (
-        <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 text-[11px] text-gray-500 leading-relaxed animate-fade-in">
-          <h4 className="font-mono uppercase tracking-wider text-gray-400 mb-2 text-xs">Methodology v2</h4>
-          <p className="mb-2">
-            Dual-timeframe scoring engine. Each signal produces a raw score (-100 to +100) normalised against its typical daily range. Final scores are computed using <strong className="text-gray-400">adaptive weights</strong> that factor in three dimensions:
-          </p>
-          <p className="mb-2">
-            <strong className="text-gray-400">Base weight</strong> — empirical correlation strength with BTC.
-            <strong className="text-gray-400"> Signal freshness</strong> — how recently the data was updated (stale signals are down-weighted; 4h uses aggressive decay, 24h uses gentler decay).
-            <strong className="text-gray-400"> Session relevance</strong> — TradFi signals are down-weighted when their markets are closed; crypto-native signals always have full relevance.
-          </p>
-          <p className="mb-2">
-            Uses <strong className="text-gray-400">futures data</strong> (ES, NQ, GC) instead of cash indices — these trade ~23h/day on weekdays, dramatically reducing stale-signal windows vs spot markets that only trade 6.5h/day.
-          </p>
-          <p>
-            Weights are normalised so they always sum to 100%. When TradFi signals decay (overnight, weekends), crypto-native signals automatically absorb the freed weight. This is a directional bias indicator, not a trade signal.
-          </p>
-        </div>
-      );
-    }
-
-    // =============================================
-    // MAIN APP
-    // =============================================
-    function App() {
-      const [marketData, setMarketData] = useState(null);
-      const [loading, setLoading] = useState(true);
-      const [lastUpdate, setLastUpdate] = useState(null);
-      const [liveCount, setLiveCount] = useState(0);
-      const [demoMode, setDemoMode] = useState(false);
-      const [error, setError] = useState(null);
-      const [sessionInfo, setSessionInfo] = useState(getCurrentSessionInfo());
-      const refreshInterval = useRef(null);
-      const sessionInterval = useRef(null);
-
-      // Update session info every 30 seconds
-      useEffect(() => {
-        sessionInterval.current = setInterval(() => setSessionInfo(getCurrentSessionInfo()), 30000);
-        return () => clearInterval(sessionInterval.current);
-      }, []);
-
-      const loadData = useCallback(async () => {
-        setLoading(true);
-        setError(null);
-
-        try {
-          const data = await fetchAllMarketData();
-
-          // Count live sources
-          let live = 0;
-          if (data.btcHourly?.live) live++;
-          if (data.btcBasic?.live) live++;
-          if (data.ethBtc?.live) live++;
-          if (data.fearGreed?.live) live++;
-          Object.values(data.tradfi).forEach(m => { if (m?.live) live++; });
-
-          if (live <= 1) {
-            const demo = getDemoData();
-            setMarketData({
-              btcHourly: data.btcHourly || demo.btcHourly,
-              btcBasic: data.btcBasic || demo.btcBasic,
-              ethBtc: data.ethBtc || demo.ethBtc,
-              fearGreed: data.fearGreed || demo.fearGreed,
-              tradfi: { ...demo.tradfi, ...data.tradfi },
-            });
-            setDemoMode(live === 0);
-          } else {
-            const demo = getDemoData();
-            setMarketData({
-              btcHourly: data.btcHourly || demo.btcHourly,
-              btcBasic: data.btcBasic || demo.btcBasic,
-              ethBtc: data.ethBtc || demo.ethBtc,
-              fearGreed: data.fearGreed || demo.fearGreed,
-              tradfi: Object.fromEntries(
-                Object.keys(SIGNAL_CONFIG)
-                  .filter(k => SIGNAL_CONFIG[k].yahoo)
-                  .map(k => [k, data.tradfi[k] || demo.tradfi[k]])
-              ),
-            });
-            setDemoMode(false);
-          }
-
-          setLiveCount(live);
-          setLastUpdate(new Date());
-        } catch (e) {
-          console.error(e);
-          setMarketData(getDemoData());
-          setDemoMode(true);
-          setLastUpdate(new Date());
-          setError('Using demo data — live APIs unreachable');
-        }
-
-        setLoading(false);
-      }, []);
-
-      useEffect(() => {
-        loadData();
-        refreshInterval.current = setInterval(loadData, 5 * 60 * 1000);
-        return () => clearInterval(refreshInterval.current);
-      }, [loadData]);
-
-      const signals = useMemo(() => {
-        if (!marketData) return {};
-        return computeAllSignals(marketData, sessionInfo);
-      }, [marketData, sessionInfo]);
-
-      const result4h = useMemo(() => computeScore(signals, '4h'), [signals]);
-      const result24h = useMemo(() => computeScore(signals, '24h'), [signals]);
-
-      const summary4h = useMemo(() =>
-        Object.keys(signals).length > 0 ? generateSummary(signals, result4h, '4h', sessionInfo) : '',
-        [signals, result4h, sessionInfo]
-      );
-      const summary24h = useMemo(() =>
-        Object.keys(signals).length > 0 ? generateSummary(signals, result24h, '24h', sessionInfo) : '',
-        [signals, result24h, sessionInfo]
-      );
-
-      // Split signals into TradFi and Crypto for display
-      const tradfiSignals = Object.entries(signals).filter(([_, s]) => s.category === 'tradfi');
-      const cryptoSignals = Object.entries(signals).filter(([_, s]) => s.category === 'crypto');
-
-      return (
-        <div className="max-w-6xl mx-auto px-4 py-5">
-          {/* Header */}
-          <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-2">
-            <div>
-              <h1 className="text-xl font-bold text-white tracking-tight">
-                <span className="text-orange-400">BTC</span> Macro Pulse <span className="text-xs font-mono text-gray-600 ml-1">v2</span>
-              </h1>
-              <p className="text-[10px] text-gray-500 mt-0.5 font-mono">Session-Aware Cross-Market Sentiment Engine</p>
-            </div>
-            <div className="flex items-center gap-3 text-xs font-mono">
-              {demoMode && (
-                <span className="px-2 py-0.5 bg-yellow-900/40 text-yellow-500 rounded border border-yellow-800/50 text-[10px]">DEMO</span>
-              )}
-              {!demoMode && liveCount > 0 && (
-                <span className="flex items-center gap-1 px-2 py-0.5 bg-green-900/30 text-green-400 rounded border border-green-800/50 text-[10px]">
-                  <span className="w-1.5 h-1.5 bg-green-500 rounded-full live-dot" />{liveCount} LIVE
-                </span>
-              )}
-              {lastUpdate && <span className="text-gray-600 text-[10px]">{lastUpdate.toLocaleTimeString()}</span>}
-              <button onClick={loadData} disabled={loading}
-                className="px-2.5 py-1 bg-terminal-card border border-terminal-border rounded text-gray-400 hover:text-white hover:border-gray-600 transition disabled:opacity-50 text-[10px]">
-                {loading ? '...' : 'Refresh'}
-              </button>
-            </div>
-          </header>
-
-          {error && (
-            <div className="mb-3 px-3 py-1.5 bg-yellow-900/20 border border-yellow-800/40 rounded text-yellow-500 text-[10px] font-mono">{error}</div>
-          )}
-
-          {/* Session Bar */}
-          <section className="mb-4">
-            <SessionBar sessionInfo={sessionInfo} />
-          </section>
-
-          {/* Dual Score Hero */}
-          <section className="bg-terminal-card border border-terminal-border rounded-xl p-5 mb-4">
-            <DualScoreHero score4h={result4h.score} score24h={result24h.score} summary4h={summary4h} summary24h={summary24h} loading={loading} />
-          </section>
-
-          {/* BTC Card */}
-          <section className="mb-3">
-            <BTCCard btcHourly={marketData?.btcHourly} btcBasic={marketData?.btcBasic} />
-          </section>
-
-          {/* Signal Cards */}
-          <section className="mb-1">
-            <h3 className="text-[10px] font-mono text-blue-500 uppercase tracking-widest mb-2">Traditional Markets</h3>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5 mb-4">
-              {tradfiSignals.map(([key, s]) => (
-                <MarketCard key={key} signalKey={key} signal={s}
-                  contribution4h={result4h.contributions[key]} contribution24h={result24h.contributions[key]} />
-              ))}
-            </div>
-          </section>
-
-          <section className="mb-4">
-            <h3 className="text-[10px] font-mono text-orange-500 uppercase tracking-widest mb-2">Crypto-Native Signals</h3>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5">
-              {cryptoSignals.map(([key, s]) => (
-                <MarketCard key={key} signalKey={key} signal={s}
-                  contribution4h={result4h.contributions[key]} contribution24h={result24h.contributions[key]} />
-              ))}
-            </div>
-          </section>
-
-          {/* Signal Table */}
-          <section className="mb-4">
-            <SignalTable signals={signals} result4h={result4h} result24h={result24h} />
-          </section>
-
-          {/* Methodology */}
-          <section className="mb-4">
-            <MethodologyNote sessionInfo={sessionInfo} />
-          </section>
-
-          <footer className="text-center text-[10px] text-gray-700 font-mono py-3 border-t border-terminal-border">
-            BTC Macro Pulse v2.0 &middot; Session-aware &middot; Refreshes every 5 min &middot; Not financial advice
-          </footer>
-        </div>
-      );
-    }
-
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
-  </script>
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
 </body>
 </html>
