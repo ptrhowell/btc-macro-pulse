@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BTC Macro Pulse v3 — Dual-Model Sentiment Engine</title>
+  <title>BTC Macro Pulse v3.1 — Dual-Model Sentiment Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -205,6 +205,24 @@ async function fetchFearGreed() {
   } catch(e) { return null; }
 }
 
+// Binance: BTC perp funding rate — measures derivatives positioning
+async function fetchFundingRate() {
+  try {
+    // Current funding rate
+    const r = await fetch('https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=3');
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    if (!d || d.length === 0) return null;
+    const latest = d[d.length - 1];
+    const rate = parseFloat(latest.fundingRate);
+    const annualized = rate * 3 * 365 * 100; // 3 funding periods/day × 365 days × 100 for %
+    // Previous rate for trend
+    const prev = d.length >= 2 ? parseFloat(d[d.length - 2].fundingRate) : rate;
+    const trend = rate - prev; // positive = funding increasing (more long pressure)
+    return { rate, annualized, prev, trend, timestamp: latest.fundingTime, live: true };
+  } catch(e) { return null; }
+}
+
 const YAHOO_SYMS = {
   sp500: 'ES%3DF', nasdaq: 'NQ%3DF', gold: 'GC%3DF',
   dxy: 'DX-Y.NYB', vix: '%5EVIX', tenYear: '%5ETNX',
@@ -212,8 +230,8 @@ const YAHOO_SYMS = {
 
 async function fetchAll() {
   const yahooProms = Object.entries(YAHOO_SYMS).map(async ([k,s]) => ({ key: k, data: await fetchYahoo(s) }));
-  const [btc7d, btcBasic, ethBtc, fg, ...yResults] = await Promise.allSettled([
-    fetchBTC7d(), fetchBTCBasic(), fetchETHBTC(), fetchFearGreed(), ...yahooProms,
+  const [btc7d, btcBasic, ethBtc, fg, funding, ...yResults] = await Promise.allSettled([
+    fetchBTC7d(), fetchBTCBasic(), fetchETHBTC(), fetchFearGreed(), fetchFundingRate(), ...yahooProms,
   ]);
   const tradfi = {};
   for (const y of yResults) { if (y.status==='fulfilled' && y.value) tradfi[y.value.key] = y.value.data; }
@@ -222,6 +240,7 @@ async function fetchAll() {
     btcBasic: btcBasic.status==='fulfilled' ? btcBasic.value : null,
     ethBtc: ethBtc.status==='fulfilled' ? ethBtc.value : null,
     fearGreed: fg.status==='fulfilled' ? fg.value : null,
+    funding: funding.status==='fulfilled' ? funding.value : null,
     tradfi,
   };
 }
@@ -235,6 +254,7 @@ function demoData() {
     btc7d: { price:97425, chg4h:0.82, chg24h:2.14, chg7d:5.3, multiDayTrend:2.1, rangePos:72, acceleration:0.46, sparkline:[95200,95800,96100,96300,96800,97100,96900,97200,97425], live:false, timestamp:n },
     btcBasic: { price:97425, change24h:2.14, volume:38200000000, marketCap:1920000000000, live:false },
     ethBtc: { priceBtc:0.0271, priceUsd:2638, change24h:-0.45, live:false },
+    funding: { rate:0.00012, annualized:13.14, prev:0.00010, trend:0.00002, timestamp:Date.now(), live:false },
     fearGreed: { value:72, label:'Greed', prevValue:68, live:false },
     tradfi: {
       sp500:  { price:6115.80, prevClose:6078.73, dailyChg:0.61, multiDayTrend:1.2, rangePos:78, marketTime:n-7200000, ageH:2, live:false },
@@ -268,7 +288,7 @@ function derive4hSignals(data, session) {
   signals.push({
     key: 'btc_4h_mom', label: 'BTC 4h Momentum', category: 'crypto',
     raw: chg4h, display: `${chg4h>=0?'+':''}${chg4h.toFixed(2)}%`,
-    score: norm(chg4h, 2.0), weight: 0.22,
+    score: norm(chg4h, 2.0), weight: 0.18,
     freshness: 1.0, relevance: sesRel,
   });
 
@@ -277,7 +297,7 @@ function derive4hSignals(data, session) {
   signals.push({
     key: 'btc_accel', label: 'BTC Acceleration', category: 'crypto',
     raw: accel, display: accel >= 0 ? 'Accelerating' : 'Decelerating',
-    score: norm(accel, 1.5), weight: 0.10,
+    score: norm(accel, 1.5), weight: 0.08,
     freshness: 1.0, relevance: sesRel,
   });
 
@@ -294,9 +314,9 @@ function derive4hSignals(data, session) {
 
   // 4-7. TradFi MOMENTUM signals (daily change, weighted by freshness)
   const tradfiConf = [
-    { key: 'sp500', label: 'S&P 500 Futures', w: 0.14, inv: false, range: 1.0, mkt: 'es_futures' },
-    { key: 'nasdaq', label: 'Nasdaq Futures', w: 0.10, inv: false, range: 1.3, mkt: 'nq_futures' },
-    { key: 'dxy', label: 'DXY (Dollar)', w: 0.14, inv: true, range: 0.4, mkt: 'forex' },
+    { key: 'sp500', label: 'S&P 500 Futures', w: 0.10, inv: false, range: 1.0, mkt: 'es_futures' },
+    { key: 'nasdaq', label: 'Nasdaq Futures', w: 0.08, inv: false, range: 1.3, mkt: 'nq_futures' },
+    { key: 'dxy', label: 'DXY (Dollar)', w: 0.11, inv: true, range: 0.4, mkt: 'forex' },
     { key: 'gold', label: 'Gold Futures', w: 0.06, inv: false, range: 0.8, mkt: 'gold_futures' },
   ];
   for (const c of tradfiConf) {
@@ -354,6 +374,40 @@ function derive4hSignals(data, session) {
     });
   }
 
+  // 11. Funding Rate — CONTRARIAN signal for 4h
+  // Extreme positive funding = overleveraged longs = bearish pressure (contrarian)
+  // Extreme negative funding = overleveraged shorts = bullish pressure (squeeze risk)
+  // Moderate funding = neutral, follow the trend
+  const { funding } = data;
+  if (funding) {
+    const ann = funding.annualized;
+    // Contrarian: high positive funding → bearish, negative funding → bullish
+    // Use non-linear mapping: moderate funding (5-15% ann) is normal and near-neutral
+    // Only extreme levels produce strong signals
+    let fScore;
+    if (ann > 50) fScore = -80;       // extreme longs, very bearish contrarian
+    else if (ann > 30) fScore = -55;
+    else if (ann > 15) fScore = -25;
+    else if (ann > 5) fScore = -8;     // slightly elevated, minor headwind
+    else if (ann > -5) fScore = 0;     // neutral range
+    else if (ann > -15) fScore = 10;
+    else if (ann > -30) fScore = 35;
+    else fScore = 65;                  // extreme shorts, strong squeeze potential
+
+    // Trend modifier: if funding is INCREASING, contrarian pressure builds faster
+    const trendMod = funding.trend > 0 ? -norm(funding.trend * 100000, 3) * 0.15 : -norm(funding.trend * 100000, 3) * 0.15;
+    fScore = Math.max(-100, Math.min(100, fScore + trendMod));
+
+    signals.push({
+      key: 'funding_4h', label: 'Funding Rate', category: 'crypto',
+      raw: funding.rate, display: `${(funding.rate*100).toFixed(4)}% (${ann>=0?'+':''}${ann.toFixed(0)}% ann.)`,
+      score: fScore, weight: 0.15,
+      freshness: 1.0, relevance: sesRel, live: funding.live,
+    });
+  } else {
+    signals.push({ key: 'funding_4h', label: 'Funding Rate', category:'crypto', missing: true, weight: 0.15 });
+  }
+
   return signals;
 }
 
@@ -397,9 +451,9 @@ function derive24hSignals(data, session) {
 
   // 4-8. TradFi REGIME signals: daily change + multi-day trend blended
   const tradfiConf = [
-    { key: 'sp500', label: 'S&P 500 Regime', w: 0.12, inv: false, range: 1.0, tRange: 1.5 },
-    { key: 'nasdaq', label: 'Nasdaq Regime', w: 0.08, inv: false, range: 1.3, tRange: 2.0 },
-    { key: 'dxy', label: 'DXY Regime', w: 0.12, inv: true, range: 0.4, tRange: 0.6 },
+    { key: 'sp500', label: 'S&P 500 Regime', w: 0.08, inv: false, range: 1.0, tRange: 1.5 },
+    { key: 'nasdaq', label: 'Nasdaq Regime', w: 0.06, inv: false, range: 1.3, tRange: 2.0 },
+    { key: 'dxy', label: 'DXY Regime', w: 0.10, inv: true, range: 0.4, tRange: 0.6 },
     { key: 'gold', label: 'Gold Regime', w: 0.06, inv: false, range: 0.8, tRange: 1.2 },
     { key: 'tenYear', label: '10Y Yield Regime', w: 0.06, inv: true, range: 2.0, tRange: 3.0 },
   ];
@@ -429,11 +483,11 @@ function derive24hSignals(data, session) {
     signals.push({
       key: 'vix_24h', label: 'VIX Regime', category: 'tradfi',
       raw: vixLevel, display: `${vixLevel.toFixed(1)} (${vixLevel<16?'Low fear':vixLevel<20?'Normal':vixLevel<25?'Elevated':vixLevel<30?'High fear':'Extreme fear'})`, price: vd.price,
-      score: vixLevelScore, weight: 0.10,
+      score: vixLevelScore, weight: 0.08,
       freshness: freshness24h(vd.ageH), relevance: tradRel, ageH: vd.ageH, live: vd.live,
     });
   } else {
-    signals.push({ key: 'vix_24h', label: 'VIX Regime', category:'tradfi', missing: true, weight: 0.10 });
+    signals.push({ key: 'vix_24h', label: 'VIX Regime', category:'tradfi', missing: true, weight: 0.08 });
   }
 
   // 10. ETH/BTC trend
@@ -468,6 +522,36 @@ function derive24hSignals(data, session) {
     score: norm(chg7d, 8.0), weight: 0.06,
     freshness: 1.0, relevance: sesRel,
   });
+
+  // 13. Funding Rate — REGIME signal for 24h
+  // For macro regime, sustained elevated funding = overheated derivatives market
+  // We care about the absolute level and whether it's healthy or dangerous
+  const { funding } = data;
+  if (funding) {
+    const ann = funding.annualized;
+    // Level-based regime assessment:
+    // Moderate positive (5-15%) = healthy bull market, slightly positive signal
+    // High positive (>15%) = getting overheated, bearish warning
+    // Negative = short-heavy, contrarian bullish
+    let fScore;
+    if (ann > 50) fScore = -70;       // dangerously overheated
+    else if (ann > 30) fScore = -45;
+    else if (ann > 15) fScore = -20;   // elevated, caution
+    else if (ann > 5) fScore = 15;     // healthy bullish positioning
+    else if (ann > 0) fScore = 10;     // neutral-positive
+    else if (ann > -5) fScore = 5;     // neutral
+    else if (ann > -15) fScore = 25;   // shorts building, contrarian bullish
+    else fScore = 50;                  // extreme shorts, strongly bullish regime
+
+    signals.push({
+      key: 'funding_24h', label: 'Funding Regime', category: 'crypto',
+      raw: funding.rate, display: `${(funding.rate*100).toFixed(4)}% (${ann>=0?'+':''}${ann.toFixed(0)}% ann.)`,
+      score: fScore, weight: 0.10,
+      freshness: 1.0, relevance: sesRel, live: funding.live,
+    });
+  } else {
+    signals.push({ key: 'funding_24h', label: 'Funding Regime', category:'crypto', missing: true, weight: 0.10 });
+  }
 
   return signals;
 }
@@ -706,15 +790,15 @@ function SignalPanel({ title, subtitle, color, signals, score }) {
 function MethodNote() {
   return (
     <div className="bg-terminal-card border border-terminal-border rounded-lg p-4 text-[11px] text-gray-500 leading-relaxed animate-fade-in">
-      <h4 className="font-mono uppercase tracking-wider text-gray-400 mb-2 text-xs">Methodology v3 — Dual Model</h4>
+      <h4 className="font-mono uppercase tracking-wider text-gray-400 mb-2 text-xs">Methodology v3.1 — Dual Model + Funding</h4>
       <p className="mb-2">
         v3 uses <strong className="text-blue-400">two fundamentally different scoring models</strong>, not just different weights on the same signals:
       </p>
       <p className="mb-2">
-        <strong className="text-blue-400">4h Tactical Momentum</strong> asks "what is the short-term flow direction?" It uses BTC's 4-hour price change as its dominant signal (22% weight), plus a unique <strong className="text-gray-400">acceleration</strong> signal (is the move speeding up or fading?), VIX <em>change direction</em> (is fear rising or falling right now?), Fear & Greed <em>shift</em> (is sentiment changing?), and a mean-reversion-aware range position.
+        <strong className="text-blue-400">4h Tactical Momentum</strong> asks "what is the short-term flow direction?" It uses BTC's 4-hour price change (18% weight) and <strong className="text-gray-400">perp funding rate as a contrarian signal</strong> (15% weight — extreme positive funding signals overleveraged longs vulnerable to liquidation). Also includes acceleration, VIX direction, sentiment shift, and mean-reversion-aware range position.
       </p>
       <p className="mb-2">
-        <strong className="text-purple-400">24h Macro Regime</strong> asks "what is the broader environment?" It uses BTC's <strong className="text-gray-400">multi-day trend direction</strong> as a key signal (12% weight), blends daily changes with 3-5 day trends for each TradFi asset (60% trend / 40% daily), uses VIX <em>absolute level</em> bands instead of direction, Fear & Greed <em>absolute level</em>, and a trend-confirming range position.
+        <strong className="text-purple-400">24h Macro Regime</strong> asks "what is the broader environment?" It uses BTC's <strong className="text-gray-400">multi-day trend direction</strong> (12% weight), <strong className="text-gray-400">funding rate regime</strong> (10% weight — sustained high funding = overheated market, negative funding = contrarian bullish), blended TradFi trends (60% multi-day / 40% daily), VIX <em>absolute level</em> bands, and Fear & Greed <em>absolute level</em>.
       </p>
       <p>
         The same raw data produces different derived signals for each model. Session relevance and freshness decay still apply as adaptive weight multipliers. When scores diverge significantly, the dashboard explains why — e.g., "short-term pullback within bullish regime."
@@ -743,15 +827,15 @@ function App() {
     try {
       const d = await fetchAll();
       let live = 0;
-      if(d.btc7d?.live) live++; if(d.btcBasic?.live) live++; if(d.ethBtc?.live) live++; if(d.fearGreed?.live) live++;
+      if(d.btc7d?.live) live++; if(d.btcBasic?.live) live++; if(d.ethBtc?.live) live++; if(d.fearGreed?.live) live++; if(d.funding?.live) live++;
       Object.values(d.tradfi).forEach(m => { if(m?.live) live++; });
       const demo = demoData();
       if (live <= 1) {
-        setData({ btc7d:d.btc7d||demo.btc7d, btcBasic:d.btcBasic||demo.btcBasic, ethBtc:d.ethBtc||demo.ethBtc, fearGreed:d.fearGreed||demo.fearGreed, tradfi:{...demo.tradfi,...d.tradfi} });
+        setData({ btc7d:d.btc7d||demo.btc7d, btcBasic:d.btcBasic||demo.btcBasic, ethBtc:d.ethBtc||demo.ethBtc, fearGreed:d.fearGreed||demo.fearGreed, funding:d.funding||demo.funding, tradfi:{...demo.tradfi,...d.tradfi} });
         setIsDemo(live===0);
       } else {
         setData({
-          btc7d:d.btc7d||demo.btc7d, btcBasic:d.btcBasic||demo.btcBasic, ethBtc:d.ethBtc||demo.ethBtc, fearGreed:d.fearGreed||demo.fearGreed,
+          btc7d:d.btc7d||demo.btc7d, btcBasic:d.btcBasic||demo.btcBasic, ethBtc:d.ethBtc||demo.ethBtc, fearGreed:d.fearGreed||demo.fearGreed, funding:d.funding||demo.funding,
           tradfi: Object.fromEntries(Object.keys(YAHOO_SYMS).map(k => [k, d.tradfi[k]||demo.tradfi[k]])),
         });
         setIsDemo(false);
@@ -778,7 +862,7 @@ function App() {
     <div className="max-w-6xl mx-auto px-4 py-5">
       <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-2">
         <div>
-          <h1 className="text-xl font-bold text-white tracking-tight"><span className="text-orange-400">BTC</span> Macro Pulse <span className="text-xs font-mono text-gray-600 ml-1">v3</span></h1>
+          <h1 className="text-xl font-bold text-white tracking-tight"><span className="text-orange-400">BTC</span> Macro Pulse <span className="text-xs font-mono text-gray-600 ml-1">v3.1</span></h1>
           <p className="text-[10px] text-gray-500 mt-0.5 font-mono">Dual-Model Session-Aware Sentiment Engine</p>
         </div>
         <div className="flex items-center gap-3 text-xs font-mono">
@@ -807,7 +891,7 @@ function App() {
       <section className="mb-4"><MethodNote/></section>
 
       <footer className="text-center text-[10px] text-gray-700 font-mono py-3 border-t border-terminal-border">
-        BTC Macro Pulse v3.0 &middot; Dual-model &middot; Session-aware &middot; Refreshes every 5 min &middot; Not financial advice
+        BTC Macro Pulse v3.1 &middot; Dual-model + Funding Rate &middot; Session-aware &middot; Refreshes every 5 min &middot; Not financial advice
       </footer>
     </div>
   );
